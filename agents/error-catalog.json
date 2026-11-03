@@ -1,0 +1,258 @@
+{
+  "$comment": [
+    "Every error code the Candle agent launch and trade rail returns, grouped so an agent can decide what to do",
+    "without parsing prose. Branch on `code`, never on `message`: the code is stable, the message",
+    "is written for humans and will change.",
+    "",
+    "`retryable` means the SAME request may succeed later, unchanged. Explicit error.retryable",
+    "overrides category defaults. Read error.routing.reason when present.",
+    "MARKET_NOT_FOUND keeps its 404 and baseline retryability; finer reasons disambiguate it.",
+    "MARKET_NOT_FOUND is deprecated on migrating surfaces; forensics retains its coverage refusal.",
+    "",
+    "Source of truth is LAUNCH_ERROR_CODES in the monorepo. Coverage is asserted in CI, so a new",
+    "code cannot ship without landing in a category here. LP and perps routes return their own",
+    "LP_* and PERPS_* codes, which this catalog does not cover yet."
+  ],
+  "version": 1,
+  "categories": {
+    "auth": {
+      "retryable": false,
+      "action": "Fix the credential. Run `candle doctor` to tell 'no key' apart from 'wrong environment' and 'revoked'.",
+      "codes": [
+        "UNAUTHORIZED",
+        "KEY_EXPIRED",
+        "DEVICE_TOKEN_INVALID",
+        "DEVICE_CODE_EXPIRED",
+        "DEVICE_CODE_NOT_FOUND",
+        "CONNECT_REQUEST_EXPIRED",
+        "CONNECT_REQUEST_NOT_FOUND",
+        "CONNECTION_NOT_FOUND",
+        "SCOPE_MISSING",
+        "TEST_ENVIRONMENT_FORBIDDEN",
+        "LOOSEN_REQUIRES_SESSION",
+        "KEY_SIGNER_OWNER_INVALID",
+        "SIWX_INVALID"
+      ]
+    },
+    "rate_limit": {
+      "retryable": true,
+      "action": "Back off and retry after the named window: honor retry_after_seconds when the body carries it (SWAP_ROUTE_FAILING), back off exponentially otherwise. DAILY_CAP_REACHED and ACCOUNTS_DAILY_CAP reset on the UTC day, so do not retry them inside the same day.",
+      "codes": ["RATE_LIMITED", "DAILY_CAP_REACHED", "SWAP_ROUTE_FAILING", "ACCOUNTS_DAILY_CAP"]
+    },
+    "payment": {
+      "retryable": true,
+      "action": "The call has a price, or a payment for it is still being confirmed. PAYMENT_REQUIRED: the response names the price; pay only within your own spending limits, then send the same request once with the payment. PAYMENT_PENDING and PAYMENT_IN_PROGRESS: send the SAME request with the SAME payment again shortly and never pay a second time. PAYMENT_UNAVAILABLE: nothing was charged; retry later.",
+      "codes": ["PAYMENT_REQUIRED", "PAYMENT_PENDING", "PAYMENT_IN_PROGRESS", "PAYMENT_UNAVAILABLE"]
+    },
+    "tier": {
+      "retryable": false,
+      "action": "The account's tier does not include this capability. Surface it to the owner; an agent cannot resolve it.",
+      "codes": ["TIER_REQUIRED", "EXCLUSIVE_NOT_ELIGIBLE"]
+    },
+    "wallet_delegation": {
+      "retryable": false,
+      "action": "Needs a human in the browser to delegate an embedded wallet. Report exactly which chain is undelegated. EMBEDDED_WALLET_NOT_PERMITTED means the owner withheld the embedded wallet from this key: trade a TEE wallet bound to the key, or ask the owner to allow it. BRIDGE_DESTINATION_MISSING is not retryable: promote one verified destination TEE wallet onto this key, or pass toWalletId when more than one qualifies.",
+      "codes": [
+        "AGENT_WALLET_MISSING",
+        "AGENT_WALLET_NOT_DELEGATED",
+        "AGENT_WALLET_NOT_EMBEDDED",
+        "DELEGATION_REVOKED",
+        "EMBEDDED_WALLET_NOT_PERMITTED",
+        "SIGNER_MISMATCH",
+        "BRIDGE_DESTINATION_MISSING"
+      ]
+    },
+    "profile_permission": {
+      "retryable": false,
+      "action": "Public page editing is off for this key or an admin locked the profile. Only the owner Privy session can restore the permission; only an admin can lift the lock.",
+      "codes": ["PROFILE_SELF_EDIT_DENIED"]
+    },
+    "spend_policy": {
+      "retryable": false,
+      "action": "A spend limit refused the amount. Lower the amount or have the owner raise the limit. Never retry the same size.",
+      "codes": ["SPEND_LIMIT_EXCEEDED", "SPEND_POLICY_DENIED", "TRANSFER_DESTINATION_NOT_APPROVED"]
+    },
+    "request_validation": {
+      "retryable": false,
+      "action": "The request is malformed. Fix the named field. For TRANSACTION_TOO_LARGE the error carries the exact name-byte budget; for CURVE_OUT_OF_RANGE with reason price_ceiling, maxThresholdRaw is the largest threshold that fits. For FEE_WALLET_UNSUPPORTED, choose an on-curve wallet or an enabled, verified Squads v4 vault; honor explicit error.retryable when verification is temporarily unavailable. For POOL_FEE_WITH_CREATOR_FEE_UNSUPPORTED, drop poolFee (the launch keeps the standard pool fee) or drop creatorFeeBps.",
+      "codes": [
+        "VALIDATION_FAILED",
+        "FEE_WALLET_UNSUPPORTED",
+        "POOL_FEE_WITH_CREATOR_FEE_UNSUPPORTED",
+        "CLOSE_REFUSED",
+        "INVALID_NAME_BYTES",
+        "INVALID_SYMBOL",
+        "TRANSACTION_TOO_LARGE",
+        "UPLOAD_INVALID",
+        "IMAGE_TOO_LARGE",
+        "IMAGE_UNREACHABLE",
+        "IMAGE_WRONG_SHAPE",
+        "DEV_BUY_TOO_LOW",
+        "IMAGE_REDIRECT_NOT_ALLOWED",
+        "BANNER_UNREACHABLE",
+        "BANNER_WRONG_SHAPE",
+        "TRANSFER_ASSET_NOT_SUPPORTED",
+        "REBIND_TARGET_INVALID",
+        "REBIND_WALLET_INVALID",
+        "REBIND_TOO_MANY",
+        "KEY_SIGNER_CODE_INVALID",
+        "KEY_SIGNER_FINGERPRINT_MISMATCH",
+        "CURVE_OUT_OF_RANGE",
+        "ACCOUNTS_NAME_INVALID",
+        "SIGNER_PUBLIC_KEY_INVALID",
+        "USERNAME_INVALID",
+        "SCOPE_NOT_ALLOWED"
+      ]
+    },
+    "market": {
+      "retryable": false,
+      "action": "Read error.routing.reason and error.discovery. Explicit error.retryable overrides this default (graduation/no_candidates can retry). For a refusal from a Candle-only endpoint, request POST /api/v1/trade/agent/quote; that guidance does not promise liquidity, access or external limit orders. POOL_AT_FLOOR: a graduated Solana token's own pool has no buyers below its launch price for this sell; sell less or wait for buyers, since the same sell reproduces it.",
+      "codes": [
+        "MARKET_NOT_FOUND",
+        "MARKET_NOT_TRADABLE",
+        "POOL_AT_FLOOR",
+        "PAIR_UNSUPPORTED",
+        "QUOTE_PAIR_UNKNOWN",
+        "DEV_BUY_UNSUPPORTED_FOR_PAIR"
+      ]
+    },
+    "sizing": {
+      "retryable": true,
+      "action": "Retry only after changing the amount or slippage. Re-quote first: repeating the same size reproduces the same failure.",
+      "codes": [
+        "AMOUNT_TOO_LOW",
+        "DEV_BUY_TOO_HIGH",
+        "SLIPPAGE_EXCEEDED",
+        "INSUFFICIENT_OWNER_BALANCE",
+        "TRANSFER_AMOUNT_UNAVAILABLE",
+        "GAS_INSUFFICIENT"
+      ]
+    },
+    "token_transfer": {
+      "retryable": false,
+      "action": "Report the token left behind after the failed send. Non-transferable tokens cannot move; frozen accounts need the issuer to thaw them. For hook refusal or missing extra accounts, resolve the hook requirements and rebuild before retrying. These codes never refuse a quote.",
+      "codes": [
+        "TOKEN_2022_NOT_TRANSFERABLE",
+        "TOKEN_2022_HOOK_REFUSED",
+        "TOKEN_2022_EXTRA_ACCOUNTS_MISSING",
+        "TOKEN_2022_FROZEN"
+      ]
+    },
+    "transient": {
+      "retryable": true,
+      "action": "Honor explicit error.retryable before this default. Back off only when retryable, reusing the SAME idempotency id. hood_market_unavailable is a twice-failed address and remains retryable:false; wait for a changed condition, never spin or pause all Hood tokens. Do not reuse the id when `stage` is `executed`, or when `stage` is `unconfirmed` and `retryable` is false. An unconfirmed approval that did not send the trade has `retryable: true` and may reuse the id. UNKNOWN on a token metadata edit: retry with the SAME Idempotency-Key; the edit may already be recorded, and the retry finishes it without a second version.",
+      "codes": [
+        "BUILD_TIMEOUT",
+        "LAUNCH_FAILED",
+        "SWAP_FAILED",
+        "LEG2_FAILED",
+        "DEVICE_REQUEST_FAILED",
+        "QUOTE_UNAVAILABLE",
+        "FEED_UNAVAILABLE",
+        "KEY_ISSUANCE_FAILED",
+        "TRANSFER_FAILED",
+        "FEE_CLAIM_FAILED",
+        "WALLET_IMPORT_FAILED",
+        "REBIND_RECONCILE_INCOMPLETE",
+        "UNKNOWN"
+      ]
+    },
+    "state_conflict": {
+      "retryable": false,
+      "action": "The operation already happened, or the referenced object is gone. Read current state instead of retrying, or you may pay twice. QUOTE_EXPIRED is the one entry you resolve by building again: the row is fine, its price is stale. TRADE_REVERTED spent only its network fee; trade again under a new id. REBIND_BUILD_OPEN carries retryAfter: stop the old key and rebind after it. REBIND_FORWARD_OPEN has no clock: a sign is in flight or not yet provably expired; nothing changed. CLOSE_IN_PROGRESS: an earlier close under this id is still sending; read its job. CLOSE_FAILED closed nothing and settled its id; preview again and close under a new id. BRIDGE_IN_FLIGHT: a bridge into or out of this wallet is still open; read `candle swap status` and record the sweep once it closes or its two hours pass. HOLD_NOT_RELEASABLE: the trade's USD window hold stays; when error.retryable is true, call again after retryAfter (or at once for reason `changed`). FEE_NOT_CLAIMABLE: nothing was signed; error.reason says who can claim or why not (below_dust, wallet_not_signable, not_recipient, insufficient_gas, fee_wallet_designated, claimable_via_web_session), and only below_dust and insufficient_gas change with time or funding. ACCOUNT_EXISTS and PAYER_IN_SIGNUP: the wallet already has an account or a signup under way; do not create another. INPUT_MISMATCH and SIGNER_MISMATCH on an account signup: resume with the original inputs and signer, never new ones. TERMS_VERSION_STALE: show the version in error.data and ask again. NOT_TOKEN_CREATOR, TOKEN_NOT_FOUND, TOKEN_NOT_LIVE, ONCHAIN_METADATA_TOKEN and TEE_LAUNCHED_HOOD_TOKEN refuse a token metadata edit and wrote nothing: only the launching account may edit, the token must be a confirmed Candle token, and a post-cutover Hood token is edited on chain with POST /api/v1/hood/metadata/edit instead.",
+      "codes": [
+        "IDEMPOTENCY_CONFLICT",
+        "TRADE_ALREADY_CLAIMED",
+        "TRADE_NOT_CONFIRMED",
+        "ORDER_ALREADY_FILLED",
+        "ORDER_NOT_FOUND",
+        "ORDER_NOT_TRIGGERED",
+        "JOB_NOT_FOUND",
+        "RECORD_NOT_FOUND",
+        "RECEIPT_NOT_FOUND",
+        "QUOTE_EXPIRED",
+        "TRADE_REVERTED",
+        "UNRECOGNIZED_TRANSACTION",
+        "WALLET_ALREADY_LINKED",
+        "WALLET_ALREADY_REGISTERED",
+        "REBIND_STALE",
+        "REBIND_BUILD_OPEN",
+        "REBIND_FORWARD_OPEN",
+        "KEY_ACCESS_STALE",
+        "KEY_ACCESS_PARTNER_KEY",
+        "KEY_SIGNER_MISSING",
+        "KEY_SIGNER_CHANGED",
+        "KEY_SIGNER_ALREADY_ACTIVE",
+        "KEY_SIGNER_READBACK_MISMATCH",
+        "KEY_SIGNER_SIGNATURE_REQUIRED",
+        "KEY_SIGNER_OWNS_WALLETS",
+        "WALLET_BUSY",
+        "BRIDGE_IN_FLIGHT",
+        "CLOSE_IN_PROGRESS",
+        "CLOSE_FAILED",
+        "HOLD_NOT_RELEASABLE",
+        "FEE_NOT_CLAIMABLE",
+        "OPERATION_PENDING",
+        "PAYMENT_ALREADY_USED",
+        "TERMS_VERSION_STALE",
+        "INPUT_MISMATCH",
+        "ACCOUNT_EXISTS",
+        "PAYER_IN_SIGNUP",
+        "USERNAME_TAKEN",
+        "TOKEN_NOT_FOUND",
+        "NOT_TOKEN_CREATOR",
+        "TOKEN_NOT_LIVE",
+        "ONCHAIN_METADATA_TOKEN",
+        "TEE_LAUNCHED_HOOD_TOKEN"
+      ]
+    },
+    "quota": {
+      "retryable": false,
+      "action": "A per-account ceiling is full. Revoke or delete something first; waiting does not help. KEY_LIMIT_REACHED is the key's USD volume cap: honor error.retryable. With resetsAt, retry after it or trade a smaller amount. With reason limit_unavailable, Candle could not value the trade, read the key's usage, or reserve the cap, so nothing was signed: wait until error.retryAfter, back off exponentially if it repeats, and never rebuild in a tight loop. AGENT_FEE_OWED: the paying wallet still owes a platform fee from an earlier Hood trade; nothing was sent, and contact support with the trade id from the error message to resolve the owed fee before the wallet trades again.",
+      "codes": [
+        "KEY_LIMIT_REACHED",
+        "ORDER_LIMIT_REACHED",
+        "WALLET_LIMIT_REACHED",
+        "WEBHOOK_LIMIT_REACHED",
+        "REBIND_SCOPE_FULL",
+        "AGENT_FEE_OWED"
+      ]
+    },
+    "availability": {
+      "retryable": true,
+      "action": "The capability is switched off or a required leg is absent in this environment. Retry later; escalate if it persists. TEST_FLEET_PRODUCTION_DISABLED is a standing refusal on any deployment that is not staging: do not retry it there.",
+      "codes": [
+        "LAUNCH_DISABLED",
+        "FEE_LEG_MISSING",
+        "HOOD_LAUNCH_UNAVAILABLE",
+        "CLOSE_LEDGER_UNAVAILABLE",
+        "PERPS_WITHDRAW_DISABLED",
+        "TOKEN_EVENTS_DISABLED",
+        "TOKEN_CARD_DISABLED",
+        "TEST_FLEET_PRODUCTION_DISABLED",
+        "ACCOUNTS_UNAVAILABLE",
+        "METADATA_EDIT_DISABLED"
+      ]
+    },
+    "venue_refused": {
+      "retryable": false,
+      "action": "Candle checked the venue's transaction before anything was stamped and refused it: another target, another program, or a larger debit than the amount. Nothing was signed and nothing moved. Do not retry the same request in a loop; report the refusal with its message. A venue contract change needs a Candle release.",
+      "codes": ["RELAY_STEP_REFUSED"]
+    },
+    "risk_stop": {
+      "retryable": false,
+      "action": "This profile stopped itself: it reached a loss limit its owner set, or tripped its circuit breaker. Waiting does not clear it and neither does a smaller amount. Stop trading on this profile, report why, and leave it to an account owner to review and resume. GET /agent/keys/{prefix}/risk says which bound broke.",
+      "codes": ["RISK_LIMIT_REACHED"]
+    },
+    "owner_stop": {
+      "retryable": false,
+      "action": "An account owner paused this profile deliberately. This is not a fault and not a limit the profile reached on its own -- nothing about the request will change it and waiting will not clear it. Stop trading on this key and say plainly that only the owner can resume it, from the agent console.",
+      "codes": ["PROFILE_PAUSED"]
+    },
+    "account_blocked": {
+      "retryable": false,
+      "action": "Candle blocked this account. Every key it held is revoked and new keys are refused. Nothing the agent or the owner does from the console clears it. Stop, and tell the owner to contact Candle support.",
+      "codes": ["ACCOUNT_BLOCKED"]
+    }
+  }
+}

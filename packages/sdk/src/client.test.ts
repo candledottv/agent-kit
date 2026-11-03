@@ -1,0 +1,5150 @@
+/**
+ * Pure client tests with an injected fake fetch: request-shape snapshots (URL, method, headers,
+ * body) for every method so the wire contract cannot drift silently, envelope-to-CandleApiError
+ * mapping, the launch() retry policy, and waitForLaunch() polling. No server, no network.
+ */
+
+import { describe, expect, test } from "bun:test"
+import { keccak_256 } from "@noble/hashes/sha3"
+import { base58 } from "@scure/base"
+import {
+  __setEvmReceiptWaitForTest,
+  type AgentTierInfo,
+  type BuildAtomicLaunchRequest,
+  type BuildSelfLaunchRequest,
+  type BuildTradeRequest,
+  type BuildTradeResult,
+  CandleClient,
+  type CandleClientOptions,
+  type ConfirmSelfLaunchRequest,
+  type ConfirmTradeRequest,
+  type EvmSignTransactionParams,
+  type LaunchAtomicRequest,
+  type LaunchRequest,
+  type ListWalletsResult,
+  type PortfolioResult,
+  type PresetsPayload,
+  type SelfBalancesResult,
+  type SelfLaunchRequest,
+  type SpendLimitsResult,
+  type SubmitAtomicLaunchRequest,
+  type SubmitTradeRequest,
+  type SwapResult,
+  type SwapSettlement,
+  type WalletKind,
+} from "./client"
+
+import {
+  CandleApiError,
+  CandleOperationError,
+  JsonRpcError,
+  operationIds,
+  SelfLaunchOutcomeError,
+  TradeLandedFeeLegError,
+  TradeLandedUnconfirmedError,
+  TradeLegOutcomeError,
+} from "./errors"
+import * as packageRoot from "./index"
+import { InMemorySecretStore, type SecretStore } from "./secret-store"
+import { generateSignerKeypair } from "./wallet-import"
+
+interface RecordedRequest {
+  url: string
+  method: string
+  headers: Record<string, string>
+  body?: unknown
+}
+
+/** Queue of responses (or Errors to throw as network failures), with an optional fallback factory. */
+function fakeFetch(responses: (Response | Error)[], fallback?: () => Response) {
+  const calls: RecordedRequest[] = []
+  const queue = [...responses]
+  const impl = (async (input: unknown, init?: RequestInit) => {
+    calls.push({
+      url: String(input),
+      method: init?.method ?? "GET",
+      headers: { ...((init?.headers ?? {}) as Record<string, string>) },
+      ...(init?.body !== undefined && init?.body !== null ? { body: init.body } : {}),
+    })
+    const next = queue.shift() ?? fallback?.()
+    if (!next) throw new Error("fake fetch: no response queued")
+    if (next instanceof Error) throw next
+    return next
+  }) as unknown as typeof fetch
+  return { calls, impl }
+}
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
+}
+
+function envelope(
+  status: number,
+  code: string,
+  opts: {
+    retryable?: boolean
+    field?: string
+    message?: string
+    stage?: string
+    mint?: string
+    signature?: string
+  } = {},
+): Response {
+  return json(status, {
+    success: false,
+    error: {
+      code,
+      message: opts.message ?? `${code} message`,
+      ...(opts.field !== undefined ? { field: opts.field } : {}),
+      ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+      ...(opts.mint !== undefined ? { mint: opts.mint } : {}),
+      ...(opts.signature !== undefined ? { signature: opts.signature } : {}),
+      retryable: opts.retryable === true,
+    },
+  })
+}
+
+function makeClient(
+  opts: Partial<Omit<CandleClientOptions, "apiUrl" | "fetch">>,
+  responses: (Response | Error)[],
+  fallback?: () => Response,
+) {
+  const { calls, impl } = fakeFetch(responses, fallback)
+  const client = new CandleClient({ apiUrl: "https://api.test", fetch: impl, ...opts })
+  return { client, calls }
+}
+
+const KEYED = { apiKey: "cndl_test_key" }
+const JSON_HEADERS = { "content-type": "application/json", "x-api-key": "cndl_test_key" }
+
+const LAUNCH_REQ: LaunchRequest = {
+  clientLaunchId: "run-1",
+  chain: "solana",
+  name: "Trend Coin",
+  symbol: "TREND",
+  imageUrl: "https://example.com/logo.png",
+}
+
+const LAUNCH_OK = {
+  success: true,
+  chain: "solana",
+  mint: "Mint111",
+  pool: "Pool111",
+  signature: "Sig111",
+  quoteAsset: "sol",
+  mode: "open",
+  stakerAllocationBps: 50,
+  matrixVersion: 1,
+  links: { candle: "https://candle.tv/token/Mint111", explorer: "https://solscan.io/tx/Sig111" },
+  nextBuy: { market: "Pool111", quoteAsset: "sol", marketStateUrl: "/api/v1/markets/solana/Mint111" },
+}
+
+function jobBody(status: "submitted" | "confirming" | "confirmed" | "failed") {
+  return {
+    success: true,
+    job: { clientLaunchId: "run-1", chain: "solana", status, createdAt: 1, updatedAt: 2 },
+  }
+}
+
+describe("apiUrl transport security", () => {
+  test("an http:// apiUrl to a real host is refused at construction", () => {
+    // The client attaches x-api-key to every authenticated call, so a cleartext base URL hands
+    // the key to anything on the path. The constructor used to only trim trailing slashes.
+    expect(() => new CandleClient({ apiUrl: "http://api.candle.tv", apiKey: "cndl_live_k" })).toThrow(
+      /refusing to send credentials in the clear/i,
+    )
+  })
+
+  test("loopback over http is allowed, in each of its spellings", () => {
+    for (const apiUrl of ["http://localhost:3000", "http://127.0.0.1:8080", "http://[::1]:3000"]) {
+      expect(() => new CandleClient({ apiUrl })).not.toThrow()
+    }
+  })
+
+  test("allowInsecureHttp opts a non-loopback PRIVATE host back in", () => {
+    expect(
+      () => new CandleClient({ apiUrl: "http://host.docker.internal:3000", allowInsecureHttp: true }),
+    ).not.toThrow()
+    for (const host of ["10.0.0.5", "192.168.1.10", "172.16.4.2", "dev-box", "api.local"]) {
+      expect(() => new CandleClient({ apiUrl: `http://${host}:3000`, allowInsecureHttp: true })).not.toThrow()
+    }
+  })
+
+  /**
+   * The escape hatch covers private networks and stops there. Its whole purpose is a devcontainer
+   * reaching its host, which is always private; letting the same opt-in cover a public address is
+   * what turns it into an API key read off the wire, and a stale `allowInsecureHttp: true` left in
+   * someone's code should not be able to do that.
+   */
+  test("allowInsecureHttp does NOT opt a public host back in", () => {
+    for (const host of ["api.example.com", "203.0.113.7", "8.8.8.8"]) {
+      expect(() => new CandleClient({ apiUrl: `http://${host}`, allowInsecureHttp: true })).toThrow(/public address/)
+    }
+  })
+
+  test("carrier-grade NAT is not treated as your network", () => {
+    expect(() => new CandleClient({ apiUrl: "http://100.64.0.1", allowInsecureHttp: true })).toThrow()
+  })
+
+  test("https is unaffected, and a non-http scheme is rejected as such", () => {
+    expect(() => new CandleClient({ apiUrl: "https://api.test" })).not.toThrow()
+    expect(() => new CandleClient({ apiUrl: "ftp://api.test" })).toThrow(/must be http or https/i)
+    expect(() => new CandleClient({ apiUrl: "not a url" })).toThrow(/not a valid URL/i)
+  })
+})
+
+describe("request shapes", () => {
+  test("getQuotePairs: GET /api/v1/launch/quote-pairs, no auth header without a key", async () => {
+    const payload = { matrixVersion: 1, pairs: { solana: [] }, defaults: { solana: "sol" } }
+    const { client, calls } = makeClient({}, [json(200, { payload })])
+    const result = await client.getQuotePairs()
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/launch/quote-pairs", method: "GET", headers: {} })
+    expect(result).toEqual(payload)
+  })
+
+  test("getQuotePairs with a chain filter", async () => {
+    const { client, calls } = makeClient({}, [json(200, { payload: { matrixVersion: 1, pairs: {}, defaults: {} } })])
+    await client.getQuotePairs("hood")
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/launch/quote-pairs?chain=hood")
+  })
+
+  test("getPresets: GET /api/v1/launch/presets, unwraps the payload", async () => {
+    const payload = { matrixVersion: 1, presets: [] }
+    const { client, calls } = makeClient({}, [json(200, { payload })])
+    const result = await client.getPresets()
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/launch/presets", method: "GET", headers: {} })
+    expect(result).toEqual(payload)
+  })
+
+  test("dryRunLaunch: POST /api/v1/launch/headless/dry-run with key and JSON body", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, dryRun: true })])
+    await client.dryRunLaunch(LAUNCH_REQ)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/headless/dry-run",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(LAUNCH_REQ),
+    })
+  })
+
+  test("BE-860: dryRunSelfLaunch POSTs /api/v1/launch/self/dry-run and types the paying wallet and its id", async () => {
+    const req = { ...LAUNCH_REQ, linkedWalletId: "lw_1" }
+    const wire = {
+      success: true,
+      dryRun: true,
+      launchWallet: "LinkedPayer1",
+      launchWalletId: "lw_1",
+      resolved: {
+        chain: "solana",
+        quoteAsset: "sol",
+        mode: "open",
+        stakerAllocationBps: 50,
+        dexVersion: null,
+        visibility: "production",
+        buyAmount: "0",
+      },
+      checks: { image: "ok" },
+      matrixVersion: 1,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, wire)])
+    const result = await client.dryRunSelfLaunch(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/self/dry-run",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    // Typed reads: a self dry run always names its payer, so neither field is nullable.
+    const launchWallet: string = result.launchWallet
+    const launchWalletId: string = result.launchWalletId
+    expect({ launchWallet, launchWalletId }).toEqual({ launchWallet: "LinkedPayer1", launchWalletId: "lw_1" })
+  })
+
+  test("BE-1806: exp-custom with curve and creatorFeeBps goes out as typed, and the dry run's resolved block and preview come back typed", async () => {
+    const req: LaunchRequest = {
+      ...LAUNCH_REQ,
+      mode: "exp-custom",
+      curve: { virtualQuote: "4", threshold: "20" },
+      creatorFeeBps: 100,
+      buyAmount: 300_000_000,
+    }
+    const resolved = {
+      chain: "solana",
+      quoteAsset: "sol",
+      mode: "exp-custom",
+      stakerAllocationBps: 500,
+      creatorFeeBps: 100,
+      curve: { virtualQuoteRaw: "4000000000", thresholdRaw: "20000000000" },
+      dexVersion: null,
+      visibility: "production",
+      buyAmount: "300000000",
+    }
+    const wire = {
+      success: true,
+      dryRun: true,
+      launchWallet: "SoLEmbedded1",
+      resolved,
+      curveTerms: {
+        symbol: "SOL",
+        thresholdRaw: "20000000000",
+        raise: 20,
+        startFdv: 4.21,
+        bondingFdv: 151.58,
+        supplySoldPct: 79.17,
+        virtualQuoteRaw: "4000000000",
+        firstBuyRaw: "300000000",
+        firstBuySupplyPct: 6.63,
+        firstBuy: {
+          basis: "buyAmount",
+          amountRaw: "300000000",
+          curveFeeRaw: "6000000",
+          tokensOutRaw: "65000000000000",
+          supplyPct: 6.5,
+        },
+        fees: {
+          curve: { feeBps: 200, fee: 0.02, creatorShare: 0.015, platformShare: 0.005 },
+          pool: { feeBps: 150, fee: 0.015, creatorShare: 0.0125, platformShare: 0.0025 },
+        },
+        migration: {
+          venue: "meteora_damm_v2",
+          poolFeeBps: 150,
+          poolShape: "floor",
+          openingPriceStepPct: 0,
+          lpLock: "permanent",
+        },
+      },
+      devBuyMax: "500000000",
+      checks: { image: "ok" },
+      matrixVersion: 1,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, wire)])
+    const result = await client.dryRunLaunch(req)
+    expect(JSON.parse(String(calls[0]?.body))).toMatchObject({
+      mode: "exp-custom",
+      curve: { virtualQuote: "4", threshold: "20" },
+      creatorFeeBps: 100,
+    })
+    expect(result.resolved).toEqual(resolved as typeof result.resolved)
+    const creatorFee: 100 | 200 | undefined = result.resolved.creatorFeeBps
+    const devBuyMax: string | null | undefined = result.devBuyMax
+    const step: number | undefined = result.curveTerms?.migration.openingPriceStepPct
+    expect({ creatorFee, devBuyMax, step }).toEqual({ creatorFee: 100, devBuyMax: "500000000", step: 0 })
+    expect(result.curveTerms?.firstBuy.basis).toBe("buyAmount")
+  })
+
+  test("BE-1806: dryRunAtomicLaunch POSTs /api/v1/launch/atomic/dry-run as given and types the fills", async () => {
+    const req: BuildAtomicLaunchRequest = {
+      clientLaunchId: "atomic-dry-1",
+      name: "Trend",
+      symbol: "TREND",
+      imageUrl: "https://example.com/logo.png",
+      mode: "exp-custom",
+      curve: { virtualQuote: "4", threshold: "20" },
+      creatorFeeBps: 100,
+      payer: { type: "main" },
+      firstBuys: [{ payer: { type: "main" }, amountRaw: "100000000" }],
+    }
+    const wire = {
+      success: true,
+      dryRun: true,
+      launchWallet: "SoLEmbedded1",
+      launchSigner: "server",
+      resolved: {
+        chain: "solana",
+        quoteAsset: "sol",
+        mode: "exp-custom",
+        stakerAllocationBps: 500,
+        creatorFeeBps: 100,
+        curve: { virtualQuoteRaw: "4000000000", thresholdRaw: "20000000000" },
+        visibility: "production",
+      },
+      fills: [
+        {
+          index: 1,
+          signer: "server",
+          payerType: "main",
+          wallet: "SoLEmbedded1",
+          amountRaw: "100000000",
+          feeRaw: "0",
+          expectedFill: { amountOutRaw: "23000000000000", minAmountOutRaw: "22770000000000" },
+          supplyPct: 2.3,
+        },
+      ],
+      graduatesInBundle: false,
+      checks: {},
+      matrixVersion: 1,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, wire)])
+    const result = await client.dryRunAtomicLaunch(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/atomic/dry-run",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    const minOut: string | undefined = result.fills[0]?.expectedFill.minAmountOutRaw
+    expect(minOut).toBe("22770000000000")
+    expect(result.resolved.creatorFeeBps).toBe(100)
+    expect(result.graduatesInBundle).toBe(false)
+  })
+
+  test("dryRunAtomicLaunch types the graduation preview and omits it for defaults", async () => {
+    const graduation = {
+      poolFeeSchedule: { startBps: 2500, endBps: 25 as const, minutes: 30 },
+      poolOpen: "curve_price" as const,
+      estimatedBurnRaw: "34992337456320",
+      estimatedSeedRaw: "1000",
+      maxStakerCarveBps: 600,
+      startBps: 2500,
+      endBps: 25,
+      shape: "curve_price" as const,
+      burnsRemainder: true,
+    }
+    const base = {
+      success: true,
+      dryRun: true,
+      launchWallet: "SoLEmbedded1",
+      launchSigner: "server",
+      resolved: { chain: "solana", quoteAsset: "sol", mode: "open", stakerAllocationBps: 50, visibility: "production" },
+      fills: [],
+      graduatesInBundle: false,
+      checks: {},
+      matrixVersion: 1,
+    }
+    const req: BuildAtomicLaunchRequest = {
+      clientLaunchId: "atomic-dry-2",
+      name: "Trend",
+      symbol: "TREND",
+      imageUrl: "https://example.com/logo.png",
+      poolFee: graduation.poolFeeSchedule,
+      poolOpen: "curve_price",
+      payer: { type: "main" },
+      firstBuys: [{ payer: { type: "main" }, amountRaw: "100000000" }],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, { ...base, graduation }), json(200, base)])
+    const result = await client.dryRunAtomicLaunch(req)
+    expect(JSON.parse(String(calls[0]?.body))).toMatchObject({
+      poolFee: graduation.poolFeeSchedule,
+      poolOpen: "curve_price",
+    })
+    // Typed reads: these do not compile without graduation on AtomicDryRunResult.
+    const limit: number | undefined = result.graduation?.maxStakerCarveBps
+    const burn: string | undefined = result.graduation?.estimatedBurnRaw
+    const schedule = result.graduation?.poolFeeSchedule
+    expect({ limit, burn, schedule }).toEqual({
+      limit: 600,
+      burn: "34992337456320",
+      schedule: graduation.poolFeeSchedule,
+    })
+    expect(result.graduation).toEqual(graduation)
+    const plain = await client.dryRunAtomicLaunch({ ...req, poolFee: undefined, poolOpen: undefined })
+    expect(plain).not.toHaveProperty("graduation")
+  })
+
+  test("BE-1806: dryRunAtomicLaunch needs an API key", async () => {
+    const { client } = makeClient({}, [])
+    await expect(
+      client.dryRunAtomicLaunch({
+        name: "T",
+        symbol: "T",
+        imageUrl: "https://x/y.png",
+        payer: { type: "main" },
+        firstBuys: [{ payer: { type: "main" }, amountRaw: "1" }],
+      }),
+    ).rejects.toThrow("dryRunAtomicLaunch()")
+  })
+
+  test("BE-860: dryRunSelfLaunch needs an API key", async () => {
+    const { client } = makeClient({}, [])
+    await expect(client.dryRunSelfLaunch({ ...LAUNCH_REQ, linkedWalletId: "lw_1" })).rejects.toThrow(
+      "dryRunSelfLaunch()",
+    )
+  })
+
+  test("BE-850: DryRunResult types size and checks.banner, and exclusiveEligible is optional", async () => {
+    const wire = {
+      success: true,
+      dryRun: true,
+      launchWallet: "SoLEmbedded1",
+      resolved: {
+        chain: "solana",
+        quoteAsset: "sol",
+        mode: "open",
+        stakerAllocationBps: 50,
+        dexVersion: null,
+        visibility: "production",
+        buyAmount: "0",
+      },
+      checks: { image: "ok", banner: "ok" },
+      matrixVersion: 1,
+      size: { txBytes: 1100, limit: 1232, maxNameBytes: 32, fits: true },
+    }
+    const { client } = makeClient(KEYED, [json(200, wire)])
+    const result = await client.dryRunLaunch(LAUNCH_REQ)
+    // Typed reads: these lines do not compile against a DryRunResult without the fields.
+    const maxNameBytes: number | undefined = result.size?.maxNameBytes
+    const banner: string | undefined = result.checks.banner
+    const exclusiveEligible: boolean | undefined = result.checks.exclusiveEligible
+    expect({ maxNameBytes, banner, exclusiveEligible }).toEqual({
+      maxNameBytes: 32,
+      banner: "ok",
+      exclusiveEligible: undefined,
+    })
+  })
+
+  test("launch: POST /api/v1/launch/headless with key and JSON body", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK)])
+    const result = await client.launch(LAUNCH_REQ)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/headless",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(LAUNCH_REQ),
+    })
+    expect(result).toEqual({ ...LAUNCH_OK, clientLaunchId: "run-1" } as never)
+  })
+
+  test("BE-1847: headless launch forwards the creator buy and keeps the bundled result", async () => {
+    const resultBody = { ...LAUNCH_OK, bundleId: "bundle", devBuy: { signature: "buy-sig" } }
+    const { client, calls } = makeClient(KEYED, [json(200, resultBody)])
+    const result = await client.launch({ ...LAUNCH_REQ, buyAmount: "10000000" })
+    expect(result).toMatchObject({ bundleId: "bundle", devBuy: { signature: "buy-sig" } })
+    expect(calls).toHaveLength(1)
+    expect(JSON.parse(String(calls[0]?.body)).buyAmount).toBe("10000000")
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/launch/headless")
+  })
+
+  test("launch generates a sdk- prefixed clientLaunchId when the caller omits one", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK)])
+    const { clientLaunchId: _omitted, ...withoutId } = LAUNCH_REQ
+    await client.launch(withoutId)
+    const sent = JSON.parse(String(calls[0]?.body)) as { clientLaunchId: string }
+    expect(sent.clientLaunchId).toMatch(/^sdk-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  })
+
+  test("pool choices survive launch bodies as valid preset and experimental combinations; defaults add no field", async () => {
+    const preset = {
+      mode: "open" as const,
+      poolFee: { tier: 25 as const },
+      poolOpen: "curve_price" as const,
+    }
+    const experimental = {
+      mode: "exp-b" as const,
+      poolFee: { startBps: 2500, endBps: 25 as const, minutes: 30 },
+      expPoolShape: "full_range" as const,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK), json(200, LAUNCH_OK), json(200, LAUNCH_OK)])
+    await client.launch({ ...LAUNCH_REQ, ...preset })
+    await client.launch({ ...LAUNCH_REQ, ...experimental })
+    await client.launch(LAUNCH_REQ)
+    const sent = calls.map((c) => JSON.parse(String(c.body)) as Record<string, unknown>)
+    // A preset launch: the fee tier and the price-preserving pool open.
+    expect(sent[0]).toMatchObject(preset)
+    expect(sent[0]).not.toHaveProperty("expPoolShape")
+    // An experimental launch: the falling fee and the full-range shape. No creatorFeeBps, so
+    // D-A5's refusal of a non-default pool fee with a creator fee does not apply.
+    expect(sent[1]).toMatchObject(experimental)
+    expect(sent[1]).not.toHaveProperty("poolOpen")
+    expect(sent[1]).not.toHaveProperty("creatorFeeBps")
+    for (const field of ["poolFee", "poolOpen", "expPoolShape"]) expect(sent[2]).not.toHaveProperty(field)
+  })
+
+  test("an experimental full_range launch is expressible without a cast and its body survives the wire", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK)])
+    // This assignment only compiles because LaunchRequest.mode covers the exp- modes and
+    // expPoolShape is one of its fields; the transport body below proves what the API receives.
+    const request: LaunchRequest = {
+      ...LAUNCH_REQ,
+      chain: "solana",
+      quoteAsset: "sol",
+      mode: "exp-b",
+      expPoolShape: "full_range",
+    }
+    await client.launch(request)
+    expect(JSON.parse(String(calls[0]?.body))).toMatchObject({ mode: "exp-b", expPoolShape: "full_range" })
+  })
+
+  test("pool choices reach the self-launch build body", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, dryRun: true })])
+    await client.dryRunSelfLaunch({
+      ...LAUNCH_REQ,
+      linkedWalletId: "w",
+      poolFee: { tier: 100 },
+      poolOpen: "legacy",
+    })
+    expect(JSON.parse(String(calls[0]?.body))).toMatchObject({ poolFee: { tier: 100 }, poolOpen: "legacy" })
+  })
+
+  test("dryRunLaunch types the graduation preview and keeps its carve limit, schedule and burn fields", async () => {
+    const graduation = {
+      poolFeeSchedule: { startBps: 2500, endBps: 25 as const, minutes: 30 },
+      poolOpen: "curve_price" as const,
+      estimatedBurnRaw: "34992337456320",
+      estimatedSeedRaw: "1000",
+      maxStakerCarveBps: 600,
+      startBps: 2500,
+      endBps: 25,
+      shape: "curve_price" as const,
+      burnsRemainder: true,
+    }
+    const wire = { success: true, dryRun: true, launchWallet: null, graduation }
+    const { client } = makeClient(KEYED, [json(200, wire)])
+    const result = await client.dryRunLaunch(LAUNCH_REQ)
+    // Typed reads: these do not compile without LaunchGraduationPreview on DryRunResult.
+    const limit: number | undefined = result.graduation?.maxStakerCarveBps
+    const burn: string | undefined = result.graduation?.estimatedBurnRaw
+    const schedule = result.graduation?.poolFeeSchedule
+    expect({ limit, burn, schedule }).toEqual({
+      limit: 600,
+      burn: "34992337456320",
+      schedule: graduation.poolFeeSchedule,
+    })
+    expect(result.graduation).toEqual(graduation)
+  })
+
+  test("launchAsync: sends async: true and returns the 202 body", async () => {
+    const accepted = {
+      success: true,
+      accepted: true,
+      clientLaunchId: "run-1",
+      status: "submitted",
+      jobUrl: "/api/v1/launch/headless/jobs/run-1",
+    }
+    const { client, calls } = makeClient(KEYED, [json(202, accepted)])
+    const result = await client.launchAsync(LAUNCH_REQ)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/headless",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ ...LAUNCH_REQ, async: true }),
+    })
+    expect(result).toEqual(accepted as never)
+  })
+
+  test("getLaunchJob: GET /jobs/:clientLaunchId with key, URL-encoded, unwraps the job", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, jobBody("confirmed"))])
+    const job = await client.getLaunchJob("run 1/a")
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/headless/jobs/run%201%2Fa",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(job.status).toBe("confirmed")
+  })
+
+  test("getMarket: GET /api/v1/markets/:chain/:mint, unwraps the market", async () => {
+    const market = { chain: "solana", mint: "Mint111", lifecycle: "trading" }
+    const { client, calls } = makeClient({}, [json(200, { success: true, market })])
+    const result = await client.getMarket("solana", "Mint111")
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/markets/solana/Mint111", method: "GET", headers: {} })
+    expect(result).toEqual(market as never)
+  })
+
+  test("getMarket preserves closed trade flags for a graduated, unseeded Hood curve", async () => {
+    const market = {
+      chain: "hood",
+      mint: "0xabc",
+      lifecycle: "completed",
+      buysOpen: false,
+      sellsOpen: false,
+      poolAddress: null,
+    }
+    const { client, calls } = makeClient({}, [json(200, { success: true, market })])
+    expect(await client.getMarket("hood", "0xabc")).toEqual(market as never)
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/markets/hood/0xabc")
+  })
+
+  test("getQuote: GET quote with side, amountIn, and explicit slippageBps", async () => {
+    const { client, calls } = makeClient({}, [json(200, { success: true })])
+    await client.getQuote("hood", "0xabc", { side: "buy", amountIn: "5000000000000000000", slippageBps: 75 })
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/markets/hood/0xabc/quote?side=buy&amountIn=5000000000000000000&slippageBps=75",
+      method: "GET",
+      headers: {},
+    })
+  })
+
+  test("getQuote omits slippageBps when not provided (server default applies)", async () => {
+    const { client, calls } = makeClient({}, [json(200, { success: true })])
+    await client.getQuote("solana", "Mint111", { side: "sell", amountIn: "1000" })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/markets/solana/Mint111/quote?side=sell&amountIn=1000")
+  })
+
+  test("getFeed: GET /api/v1/markets/feed with bucket, optional chain", async () => {
+    const { client, calls } = makeClient({}, [
+      json(200, { success: true, bucket: "new", tokens: [] }),
+      json(200, { success: true, bucket: "onfire", tokens: [] }),
+    ])
+    await client.getFeed("new")
+    await client.getFeed("onfire", "hood")
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/markets/feed?bucket=new", method: "GET", headers: {} })
+    expect(calls[1]?.url).toBe("https://api.test/api/v1/markets/feed?bucket=onfire&chain=hood")
+  })
+
+  test("verify: GET /api/v1/verify/:chain/:mint returns the whole body", async () => {
+    const body = { success: true, candleLaunched: false, chain: "solana", mint: "Mint111" }
+    const { client, calls } = makeClient({}, [json(200, body)])
+    const result = await client.verify("solana", "Mint111")
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/verify/solana/Mint111", method: "GET", headers: {} })
+    expect(result).toEqual(body as never)
+  })
+
+  test("reportActivity: POST /api/v1/activity/report with key and { chain, signature }", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { payload: { logged: true } })])
+    await client.reportActivity("solana", "Sig111")
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/activity/report",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ chain: "solana", signature: "Sig111" }),
+    })
+  })
+
+  test("getAgentProfile: GET /api/v1/users/:idOrWallet/agent, unwraps the agent", async () => {
+    const agent = { enabled: true, address: "So1", username: "drew", launches: 3, launchesViaApi: 2 }
+    const { client, calls } = makeClient({}, [json(200, { success: true, agent })])
+    const result = await client.getAgentProfile("drew")
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/users/drew/agent", method: "GET", headers: {} })
+    expect(result).toEqual(agent)
+  })
+
+  test("getAgentTier: GET /api/v1/agent/tier with the agent key header, returns the parsed payload", async () => {
+    const payload: AgentTierInfo = {
+      success: true,
+      tier: "pro",
+      liveTier: "pro",
+      stakedCndl: 600_000,
+      heldCndl: 0,
+      thresholds: { minStakedCndl: 500_000, minHeldCndl: 1_000_000, graceMs: 172_800_000 },
+      grace: { active: false, startedAt: null },
+      maxTierExpiresAt: null,
+      maxExpired: false,
+      feeBps: 50,
+      feeTotals: [{ chain: "solana", quoteAsset: "sol", feeRawSum: "9007199254740993", count: 3 }],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, payload)])
+    const result = await client.getAgentTier()
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/tier",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(result).toEqual(payload)
+  })
+
+  test("getAgentTier: no auth header without a key (dual auth, session leg is the dashboard's job)", async () => {
+    const payload = {
+      success: true,
+      tier: "free",
+      liveTier: "free",
+      stakedCndl: 0,
+      heldCndl: 0,
+      thresholds: { minStakedCndl: 500_000, minHeldCndl: 1_000_000, graceMs: 172_800_000 },
+      grace: { active: false, startedAt: null },
+      maxTierExpiresAt: null,
+      maxExpired: false,
+      feeBps: 100,
+      feeTotals: [],
+    }
+    const { client, calls } = makeClient({}, [json(200, payload)])
+    await client.getAgentTier()
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/agent/tier", method: "GET", headers: {} })
+  })
+
+  test("getAgentTier: carries the plan table and a promo lapse source", async () => {
+    const plans = {
+      plans: [
+        {
+          plan: "free" as const,
+          feeBps: 100,
+          perpFeeBps: 10,
+          price: null,
+          limits: { rateLimitPerMin: 30, dailyLaunchCap: 5, uploadsPerMin: 10, linkedWallets: 0 },
+        },
+      ],
+      promoMaxDays: 0,
+    }
+    const payload: AgentTierInfo = {
+      success: true,
+      tier: "free",
+      liveTier: "free",
+      stakedCndl: 0,
+      heldCndl: 0,
+      thresholds: { minStakedCndl: 500_000, minHeldCndl: 1_000_000, graceMs: 0 },
+      grace: { active: false, startedAt: null, endsAt: null },
+      maxTierExpiresAt: null,
+      maxExpired: true,
+      maxExpiredAt: 1,
+      maxExpiredSource: "promo",
+      feeBps: 100,
+      feeTotals: [],
+      maxPricing: { pricePerMonthUsd: 200, currency: "USDC", approval: "self_serve" },
+      proPricing: { pricePerMonthUsd: 50, currency: "USDC", approval: "self_serve" },
+      planTable: plans,
+    }
+    const { client } = makeClient(KEYED, [json(200, payload)])
+    expect((await client.getAgentTier()).planTable).toEqual(plans)
+  })
+
+  test("listAgents: GET /api/v1/agent/directory with no credential, unwraps the page", async () => {
+    const directory = {
+      entries: [
+        {
+          profileId: "prof_aaaaaaaaaaaaaaaa",
+          slug: "fox",
+          name: "Fox momentum",
+          avatarUrl: null,
+          bio: null,
+          owner: { username: "fox_trader" },
+          strategy: "momentum",
+          models: ["claude"],
+          publishedAt: 1,
+          lastActiveAt: null,
+          totalPnlUsd: null,
+          tradeCount: 0,
+          launchCount: 0,
+          launchesCapped: false,
+        },
+      ],
+      cursor: "newest||1|2.5",
+    }
+    const { client, calls } = makeClient({ apiKey: "cndl_live_secret" }, [json(200, { success: true, directory })])
+    expect(await client.listAgents()).toEqual(directory)
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/directory")
+    expect(calls[0]?.method).toBe("GET")
+  })
+
+  test("listAgents: every option is sent under the route's name, and a blank query is left off", async () => {
+    const page = { success: true, directory: { entries: [], cursor: null } }
+    const { client, calls } = makeClient({}, [json(200, page), json(200, page)])
+    await client.listAgents({
+      sort: "pnl",
+      strategy: "momentum",
+      query: "@fox value",
+      limit: 48,
+      cursor: "pnl|momentum|1|2",
+    })
+    await client.listAgents({ query: "  " })
+    const first = new URL(calls[0]?.url ?? "")
+    expect(first.pathname).toBe("/api/v1/agent/directory")
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      sort: "pnl",
+      strategy: "momentum",
+      q: "@fox value",
+      limit: "48",
+      cursor: "pnl|momentum|1|2",
+    })
+    expect(calls[1]?.url).toBe("https://api.test/api/v1/agent/directory")
+  })
+
+  test("listAgents: a refused strategy is a CandleApiError carrying the field", async () => {
+    const { client } = makeClient({}, [
+      json(400, {
+        success: false,
+        error: { code: "VALIDATION_FAILED", message: "strategy must be one of", field: "strategy" },
+      }),
+    ])
+    const error = (await client.listAgents({ strategy: "nope" }).catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("VALIDATION_FAILED")
+  })
+
+  test("getPlans: GET /api/v1/agent/plans with no credential, returns the table whole", async () => {
+    const body = { success: true as const, plans: [], promoMaxDays: 30 }
+    const { client, calls } = makeClient({}, [json(200, body)])
+    expect(await client.getPlans()).toEqual(body)
+    expect(calls[0]).toEqual({ url: "https://api.test/api/v1/agent/plans", method: "GET", headers: {} })
+  })
+
+  test("getPlans: an older server's 404 is a CandleApiError", async () => {
+    const { client } = makeClient({}, [
+      json(404, { success: false, error: { code: "NOT_FOUND", message: "Not found" } }),
+    ])
+    await expect(client.getPlans()).rejects.toBeInstanceOf(CandleApiError)
+  })
+
+  test("listWallets: GET /api/v1/agent/wallets with the agent key header, no query param by default", async () => {
+    const body: ListWalletsResult = {
+      success: true,
+      page: [{ _id: "row-1", chain: "solana", address: "SoLWallet1", privyWalletId: "pw-1", addedVia: "session" }],
+      isDone: true,
+      continueCursor: null,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body)])
+    const result = await client.listWallets()
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/wallets",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(result).toEqual(body)
+  })
+
+  test("BE-850: listWallets types the TEE fields and privyWalletId the server already sends", async () => {
+    // The wire row, as GET /api/v1/agent/wallets serves it: the whole linkedWallets row.
+    const wire = {
+      _id: "row-tee",
+      userAddress: "SoLOwner1",
+      chain: "evm",
+      address: "0xTee",
+      addressLower: "0xtee",
+      privyWalletId: "pw-tee",
+      privyPolicyId: "pol-1",
+      verifiedAt: 1_700_000_000_000,
+      addedVia: "agent",
+      profile: "ember-tee",
+      boundKeyPrefix: "cndl_live_abc",
+      allowLaunch: true,
+    }
+    const { client } = makeClient(KEYED, [
+      json(200, { success: true, page: [wire], isDone: true, continueCursor: null }),
+    ])
+    const [row] = (await client.listWallets()).page
+    if (!row) throw new Error("expected one row")
+    // Typed reads: these lines do not compile against a LinkedWalletRow without the fields.
+    const privyWalletId: string = row.privyWalletId
+    const profile: "ember-tee" | "ember-hot" | undefined = row.profile
+    const allowLaunch: boolean | undefined = row.allowLaunch
+    expect({ privyWalletId, profile, allowLaunch }).toEqual({
+      privyWalletId: "pw-tee",
+      profile: "ember-tee",
+      allowLaunch: true,
+    })
+  })
+
+  test("BE-860: listWallets types walletKind, the server-decided kind of each row", async () => {
+    const page = [
+      {
+        _id: "row-tee",
+        chain: "evm",
+        address: "0xTee",
+        privyWalletId: "pw-1",
+        profile: "ember-tee",
+        walletKind: "tee",
+      },
+      {
+        _id: "row-imp",
+        chain: "solana",
+        address: "SoLImp",
+        privyWalletId: "pw-2",
+        privyPolicyId: "p",
+        walletKind: "imported",
+      },
+      { _id: "row-lnk", chain: "solana", address: "SoLLnk", privyWalletId: "pw-3", walletKind: "linked" },
+    ]
+    const { client } = makeClient(KEYED, [json(200, { success: true, page, isDone: true, continueCursor: null })])
+    const rows = (await client.listWallets()).page
+    // Typed read: this does not compile against a LinkedWalletRow without the field.
+    const kinds: Array<WalletKind | undefined> = rows.map((row) => row.walletKind)
+    expect(kinds).toEqual(["tee", "imported", "linked"])
+  })
+
+  test("listWallets: includeRevoked: false is the same as omitting it (no query param)", async () => {
+    const body: ListWalletsResult = { success: true, page: [], isDone: true, continueCursor: null }
+    const { client, calls } = makeClient(KEYED, [json(200, body)])
+    await client.listWallets({ includeRevoked: false })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/wallets")
+  })
+
+  test("listWallets: includeRevoked: true appends ?includeRevoked=true", async () => {
+    const body: ListWalletsResult = {
+      success: true,
+      page: [
+        { _id: "row-1", chain: "solana", address: "SoLWallet1", privyWalletId: "pw-1", addedVia: "session" },
+        {
+          _id: "row-2",
+          chain: "evm",
+          address: "0xAbC",
+          privyWalletId: "pw-2",
+          addedVia: "agent",
+          revokedAt: 1_700_000_000_000,
+        },
+      ],
+      isDone: true,
+      continueCursor: null,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body)])
+    const result = await client.listWallets({ includeRevoked: true })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/wallets?includeRevoked=true")
+    expect(result).toEqual(body)
+  })
+
+  test("getSpendLimits: GET /api/v1/agent/keys/self/limits with the agent key header, returns the parsed shape", async () => {
+    const payload: SpendLimitsResult = {
+      success: true,
+      keyLimits: [{ asset: "sol", maxPerTxRaw: "1000000000" }],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, payload)])
+    const result = await client.getSpendLimits()
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/keys/self/limits",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(result).toEqual(payload)
+  })
+
+  test("getSpendLimits: a key with no per-key caps returns keyLimits: null (per-key only, no account fallback)", async () => {
+    const payload: SpendLimitsResult = { success: true, keyLimits: null }
+    const { client } = makeClient(KEYED, [json(200, payload)])
+    const result = await client.getSpendLimits()
+    expect(result).toEqual(payload)
+  })
+
+  test("swap: POST /api/v1/agent/swap with the key, unwrapping payload", async () => {
+    const payload = {
+      hashes: ["sig1"],
+      expectedOutRaw: "990000",
+      outDecimals: 6,
+      statusChecks: [],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, payload })])
+    const result = await client.swap({ from: "SOL", to: "USDC", amountRaw: "1000000000" })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/swap")
+    expect(calls[0]?.method).toBe("POST")
+    expect(calls[0]?.headers).toEqual(JSON_HEADERS)
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({ from: "SOL", to: "USDC", amountRaw: "1000000000" })
+    // The useful object, not the envelope: same stance as getMarket/getAgentProfile.
+    expect(result).toEqual(payload)
+  })
+
+  test("BE-505 (R8.4) swap: settlement and receiptStored pass through; absent on an older API means not measured", async () => {
+    const settlement: SwapSettlement = {
+      state: "pending",
+      legs: [{ chain: "solana", hash: "sig1", status: "pending" }],
+      in: { asset: "SOL", raw: "1000000000" },
+      expectedOutRaw: "990000",
+    }
+    const payload = { hashes: ["sig1"], expectedOutRaw: "990000", outDecimals: 6, statusChecks: [] }
+    const { client } = makeClient(KEYED, [
+      json(200, { success: true, payload: { ...payload, settlement, receiptStored: true } }),
+      json(200, { success: true, payload }),
+    ])
+    const measured: SwapResult = await client.swap({ from: "SOL", to: "USDC", amountRaw: "1000000000" })
+    expect(measured.settlement).toEqual(settlement)
+    expect(measured.receiptStored).toBe(true)
+    // Not measured: no settlement key, and certainly no zeroed amount.
+    const older = await client.swap({ from: "SOL", to: "USDC", amountRaw: "1000000000" })
+    expect(older.settlement).toBeUndefined()
+    expect(older.receiptStored).toBeUndefined()
+  })
+
+  test("BE-505 (R8.4) wallets.swapReceipt: GET /api/v1/agent/swap/receipts/{hash} with the key, returning the settlement", async () => {
+    const settlement: SwapSettlement = {
+      state: "settled",
+      legs: [{ chain: "solana", hash: "sig/1", status: "confirmed" }],
+      in: { asset: "SOL", raw: "1000000000" },
+      expectedOutRaw: "990000",
+      settledOutRaw: "991234",
+      settledOutSource: "tx_balance_delta",
+      measuredAt: { slot: 42 },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, settlement })])
+    const result = await client.wallets.swapReceipt("sig/1")
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/swap/receipts/sig%2F1",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(result).toEqual(settlement)
+  })
+
+  test("BE-505 (R8.4) wallets.swapReceipt: another key's or an unknown hash is RECEIPT_NOT_FOUND", async () => {
+    const { client } = makeClient(KEYED, [envelope(404, "RECEIPT_NOT_FOUND")])
+    const error = await client.wallets.swapReceipt("sig1").catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect((error as CandleApiError).code).toBe("RECEIPT_NOT_FOUND")
+    expect((error as CandleApiError).status).toBe(404)
+  })
+
+  test("BE-505 (R8.4) wallets.selfBalances: GET /api/v1/agent/wallets/self/balances, mints and cursor in the query", async () => {
+    const body: SelfBalancesResult = {
+      success: true,
+      keyPrefix: "cndl_test",
+      page: [
+        {
+          kind: "tee",
+          chain: "solana",
+          address: "Tee111",
+          id: "wallet-1",
+          label: "bot",
+          balances: [
+            { asset: "SOL", mint: "So11111111111111111111111111111111111111112", amountRaw: "5", decimals: 9, slot: 7 },
+          ],
+          unavailable: ["Mint111"],
+        },
+      ],
+      isDone: false,
+      continueCursor: "50",
+      complete: true,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body), json(200, body)])
+    expect(await client.wallets.selfBalances()).toEqual(body)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/wallets/self/balances",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    await client.wallets.selfBalances({ mints: ["Mint111", "0xabc"], cursor: "50" })
+    expect(calls[1]?.url).toBe("https://api.test/api/v1/agent/wallets/self/balances?mints=Mint111%2C0xabc&cursor=50")
+  })
+
+  test("BE-505 (R8.4) wallets.selfBalances: a key with no spend scope reads an empty page without complete", async () => {
+    const body = { success: true, keyPrefix: "cndl_test", page: [], isDone: true, continueCursor: null }
+    const { client } = makeClient(KEYED, [json(200, body)])
+    const result = await client.wallets.selfBalances()
+    expect(result.page).toEqual([])
+    expect(result.complete).toBeUndefined()
+  })
+
+  test("FE-438 fees.list: GET /api/v1/agent/fees, cursor and limit in the query", async () => {
+    const body = {
+      success: true,
+      page: [
+        {
+          mint: "Mint111",
+          chain: "solana",
+          recipient: "Wallet111",
+          claimableAmounts: [
+            { symbol: "SOL", mint: "So11111111111111111111111111111111111111112", decimals: 9, amountRaw: "5" },
+          ],
+          claimable: true,
+        },
+      ],
+      isDone: false,
+      continueCursor: "c1",
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body), json(200, body)])
+    expect(await client.fees.list()).toEqual(body as never)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/fees",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    await client.fees.list({ cursor: "c1", limit: 5 })
+    expect(calls[1]?.url).toBe("https://api.test/api/v1/agent/fees?cursor=c1&limit=5")
+  })
+
+  test("FE-438 fees.claim: POSTs dryRun to the mint's claim route and sends no destination", async () => {
+    const body = {
+      success: true,
+      mint: "Mint/1",
+      chain: "solana",
+      dryRun: true,
+      recipient: "Wallet111",
+      claimed: [],
+      remaining: [],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body), json(200, body)])
+    expect(await client.fees.claim("Mint/1", { dryRun: true })).toEqual(body as never)
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/fees/Mint%2F1/claim")
+    expect(calls[0]?.method).toBe("POST")
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({ dryRun: true })
+    await client.fees.claim("Mint111")
+    expect(JSON.parse(String(calls[1]?.body))).toEqual({ dryRun: false })
+  })
+
+  test("FE-438 fees.claim: a LAUNCH_DISABLED 503 answer is surfaced", async () => {
+    const { client } = makeClient(KEYED, [envelope(503, "LAUNCH_DISABLED")])
+    const error = await client.fees.claim("Mint111").catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect((error as CandleApiError).code).toBe("LAUNCH_DISABLED")
+  })
+
+  test("FE-438 fees: both need an API key", async () => {
+    const { client } = makeClient({ apiUrl: "https://api.test" } as never, [])
+    await expect(client.fees.list()).rejects.toThrow("fees.list()")
+    await expect(client.fees.claim("Mint111")).rejects.toThrow("fees.claim()")
+  })
+
+  test("swap: a cross-chain fill reports every leg's hash and its status URLs", async () => {
+    const payload = {
+      hashes: ["solanaSig", "0xhoodTx"],
+      expectedOutRaw: "5000000",
+      outDecimals: 6,
+      venueCostUsd: 0.42,
+      statusChecks: ["https://relay.link/status/abc"],
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, payload })])
+    const result = await client.swap({
+      from: "SOL",
+      to: "USDG",
+      amountRaw: "2000000000",
+      maxSlippageBps: 50,
+      clientSwapId: "fund-hood-1",
+    })
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({
+      from: "SOL",
+      to: "USDG",
+      amountRaw: "2000000000",
+      maxSlippageBps: 50,
+      clientSwapId: "fund-hood-1",
+    })
+    expect(result.hashes).toEqual(["solanaSig", "0xhoodTx"])
+    expect(result.statusChecks).toEqual(["https://relay.link/status/abc"])
+    expect(result.venueCostUsd).toBe(0.42)
+  })
+
+  test("swap: never retries, so a funding call that already landed is not repeated", async () => {
+    // launch() retries on a 5xx; swap() must not, since a second execution moves the funds twice.
+    const { client, calls } = makeClient(KEYED, [json(500, { success: false, error: { code: "INTERNAL" } })])
+    await expect(client.swap({ from: "SOL", to: "USDC", amountRaw: "1" })).rejects.toBeInstanceOf(CandleApiError)
+    expect(calls).toHaveLength(1)
+  })
+
+  test("previewCloseEmptyAccounts: POST the keep list to the preview route and return the body (BE-418)", async () => {
+    const body = {
+      success: true,
+      wallet: "Wallet1",
+      keep: ["KeepMint1"],
+      accounts: [{ account: "Acct1", mint: "Mint1", tokenProgram: "token-2022", lamports: "2074080" }],
+      accountCount: 1,
+      totalLamports: "2074080",
+      totalSol: "0.00207408",
+      transactions: 1,
+      estimatedFeeLamports: "5000",
+      netLamports: "2069080",
+      netSol: "0.00206908",
+      skipped: [],
+      undecodable: [],
+      closesPerTransaction: 20,
+      maxAccountsPerCall: 200,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, body)])
+    const result = await client.previewCloseEmptyAccounts({ keep: ["KeepMint1"] })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/wallets/embedded/close-empty/preview")
+    expect(calls[0]?.method).toBe("POST")
+    expect(calls[0]?.headers).toEqual(JSON_HEADERS)
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({ keep: ["KeepMint1"] })
+    expect(result).toEqual(body as never)
+  })
+
+  test("previewCloseEmptyAccounts: no argument sends an empty body", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true })])
+    await client.previewCloseEmptyAccounts()
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({})
+  })
+
+  test("closeEmptyAccounts: POST the id, keep and accounts, and never retry (BE-418)", async () => {
+    const report = { success: true, status: "completed", clientTradeId: "c1", signatures: ["sig1"] }
+    const { client, calls } = makeClient(KEYED, [json(200, report)])
+    const result = await client.closeEmptyAccounts({ clientTradeId: "c1", keep: ["K"], accounts: ["A1"] })
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/wallets/embedded/close-empty")
+    expect(JSON.parse(String(calls[0]?.body))).toEqual({ clientTradeId: "c1", keep: ["K"], accounts: ["A1"] })
+    expect(result).toEqual(report as never)
+
+    const failing = makeClient(KEYED, [envelope(503, "CLOSE_LEDGER_UNAVAILABLE", { retryable: true })])
+    const error = await failing.client.closeEmptyAccounts({ clientTradeId: "c2" }).catch((e) => e)
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("CLOSE_LEDGER_UNAVAILABLE")
+    expect(failing.calls).toHaveLength(1)
+  })
+
+  test("getCloseEmptyAccountsJob: GET the job route with an encoded id and unwrap the job", async () => {
+    const job = { clientTradeId: "a/b", kind: "close-empty", status: "completed", createdAt: 1 }
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, job })])
+    const result = await client.getCloseEmptyAccountsJob("a/b")
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/wallets/embedded/close-empty/jobs/a%2Fb")
+    expect(calls[0]?.method).toBe("GET")
+    expect(result).toEqual(job as never)
+  })
+
+  test("the close-empty methods require an apiKey", async () => {
+    const { client } = makeClient({}, [])
+    await expect(client.previewCloseEmptyAccounts()).rejects.toThrow("previewCloseEmptyAccounts() requires an apiKey")
+    await expect(client.closeEmptyAccounts({ clientTradeId: "c" })).rejects.toThrow("closeEmptyAccounts() requires")
+    await expect(client.getCloseEmptyAccountsJob("c")).rejects.toThrow("getCloseEmptyAccountsJob() requires")
+  })
+
+  test("uploadImage: POST raw bytes with the caller's content-type and the key", async () => {
+    const bytes = new Uint8Array([137, 80, 78, 71])
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, imageUrl: "https://gateway/img.png" })])
+    const result = await client.uploadImage(bytes, "image/png")
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/uploads/agent-image",
+      method: "POST",
+      headers: { "content-type": "image/png", "x-api-key": "cndl_test_key" },
+      body: bytes,
+    })
+    expect(result).toEqual({ imageUrl: "https://gateway/img.png" })
+  })
+
+  test("buildSelfLaunch (Solana): POST /api/v1/launch/self/build with key, returns unsigned transaction", async () => {
+    const result = {
+      success: true,
+      transaction: "AQADABc5...",
+      mint: "Mint111",
+      pool: "Pool111",
+      clientLaunchId: "run-1",
+      expiresAt: 1692345678000,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const buildReq = { ...LAUNCH_REQ, linkedWalletId: "wallet-123" }
+    const buildResult = await client.buildSelfLaunch(buildReq)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/self/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(buildReq),
+    })
+    expect(buildResult).toEqual(result as never)
+  })
+
+  test("buildSelfLaunch (Hood): POST returns calldata and curve address", async () => {
+    const result = {
+      success: true,
+      transaction: { to: "0xFactory123", data: "0xabcd1234" },
+      curveAddress: "0xCurve456",
+      clientLaunchId: "run-1",
+      expiresAt: 1692345678000,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const buildReq: BuildSelfLaunchRequest = {
+      clientLaunchId: "run-1",
+      chain: "hood",
+      name: "Trend Coin",
+      symbol: "TREND",
+      imageUrl: "https://example.com/logo.png",
+      dexVersion: "v4",
+      linkedWalletId: "wallet-123",
+    }
+    const buildResult = await client.buildSelfLaunch(buildReq)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/self/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(buildReq),
+    })
+    expect(buildResult).toEqual(result as never)
+  })
+
+  test("confirmSelfLaunch: POST /api/v1/launch/self/confirm with signature", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK)])
+    const confirmReq = {
+      clientLaunchId: "run-1",
+      signature: "5hg7XuJ8ZKm4Y9PqW3nLmZ2oT6vS8xR1nD5kQ9mP7j2K",
+    }
+    const result = await client.confirmSelfLaunch(confirmReq)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/self/confirm",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(confirmReq),
+    })
+    expect(result).toEqual({ ...LAUNCH_OK, clientLaunchId: "run-1" } as never)
+  })
+
+  test("confirmSelfLaunch with optional devBuySignature", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, LAUNCH_OK)])
+    const confirmReq = {
+      clientLaunchId: "run-1",
+      signature: "0xAbCdEf123456",
+      devBuySignature: "0x123456AbCdEf",
+    }
+    await client.confirmSelfLaunch(confirmReq)
+    const sent = JSON.parse(String(calls[0]?.body)) as typeof confirmReq
+    expect(sent.devBuySignature).toBe("0x123456AbCdEf")
+  })
+
+  test("buildTrade (main payer): POST /api/v1/trade/agent/build, executed inline", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-1",
+      chain: "solana",
+      signature: "Sig222",
+      fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+      amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-1",
+      mint: "Mint111",
+      side: "buy",
+      amountRaw: "1000000",
+      payer: { type: "main" },
+    }
+    const buildResult = await client.buildTrade(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(buildResult).toEqual(result as never)
+  })
+
+  test("buildTrade (linked payer, Solana): status built, an unsigned transaction to sign", async () => {
+    const result = {
+      success: true,
+      status: "built",
+      clientTradeId: "trade-2",
+      chain: "solana",
+      artifacts: {
+        venue: "curve",
+        transactionBase64: "AQADABc5...",
+        quoteAsset: "sol",
+        quoteMint: "So11111111111111111111111111111111111111112",
+        quoteDecimals: 9,
+      },
+      fee: { bps: 100, feeRaw: "2000", treasury: "TreasuryAddr1" },
+      expectedOutRaw: "500000",
+      minOutRaw: "495000",
+      expiresAt: 1692345678000,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-2",
+      mint: "Mint111",
+      side: "buy",
+      amountRaw: "1000000",
+      payer: { type: "linked", linkedWalletId: "wallet-123" },
+      maxSlippageBps: 100,
+    }
+    const buildResult = await client.buildTrade(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(buildResult).toEqual(result as never)
+  })
+
+  test("buildTrade (linked payer, Hood): status built, approval + trade + feeTransfer legs", async () => {
+    const result = {
+      success: true,
+      status: "built",
+      clientTradeId: "trade-3",
+      chain: "hood",
+      artifacts: {
+        venue: "curve",
+        trade: { to: "0xCurve456", data: "0xtrade", value: "0" },
+        approval: { to: "0xQuoteToken", data: "0xapprove" },
+        feeTransfer: { to: "0xTreasury", data: "0xfee", value: "0" },
+        quoteAsset: "usdg",
+        quoteDecimals: 18,
+      },
+      fee: { bps: 100, feeRaw: "3000", treasury: "0xTreasury" },
+      expectedOutRaw: "700000",
+      minOutRaw: "693000",
+      expiresAt: 1692345678000,
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-3",
+      mint: "0xMint",
+      side: "sell",
+      amountRaw: "500000",
+      payer: { type: "linked", linkedWalletId: "wallet-456" },
+    }
+    const buildResult = await client.buildTrade(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(buildResult).toEqual(result as never)
+  })
+
+  test("buildTrade forwards quoteAsset when provided (arbitrary-mint trade, Pro/Max)", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-4",
+      chain: "solana",
+      signature: "Sig444",
+      fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+      amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "usdc" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-4",
+      mint: "ArbitraryMint111",
+      side: "buy",
+      amountRaw: "1000000",
+      payer: { type: "main" },
+      quoteAsset: "usdc",
+    }
+    await client.buildTrade(req)
+    const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+    expect(sent.quoteAsset).toBe("usdc")
+  })
+
+  test("buildTrade forwards a Hood quoteAsset, so a caller can echo /quote's answer", async () => {
+    // "eth" is what /trade/agent/quote returns for a Hood DEX trade. Before the validator widened
+    // this was a 400; now it must reach the wire unchanged and, above all, type-check without a
+    // cast.
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-hood-eth",
+      chain: "hood",
+      signature: "0xabc",
+      fee: { bps: 0, feeRaw: "0", treasury: "0x00000000000000000000000000000000000000fe" },
+      amounts: {
+        amountRaw: "2000000000000000",
+        expectedOutRaw: "49111866775705432588",
+        minOutRaw: "48620748107948378162",
+        quoteAsset: "eth",
+      },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-hood-eth",
+      mint: "0x385f4f8ae47651ce5f58f5265395a669f8281e18",
+      side: "buy",
+      amountRaw: "2000000000000000",
+      payer: { type: "main" },
+      quoteAsset: "eth",
+    }
+    await client.buildTrade(req)
+    const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+    expect(sent.quoteAsset).toBe("eth")
+  })
+
+  test("a Hood executed result carries route with source, kind and hops, and none of it is stripped", async () => {
+    // The 2026-09-08 live fill: main payer, so no artifacts, and the only way a typed client can
+    // see which router and pools its own trade went through is this field. A kind-only fixture
+    // would pass with `{ kind: string }`, which is exactly the under-typing being fixed, so
+    // source and hops are asserted too.
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-hood-route",
+      chain: "hood",
+      signature: "0xa7e3a40b7d14d386a707bca9b7e4daaac74171511e6170699f4db653a59f59d6",
+      fee: { bps: 0, feeRaw: "0", treasury: "0x00000000000000000000000000000000000000fe" },
+      amounts: {
+        amountRaw: "2000000000000000",
+        expectedOutRaw: "49111866775705432588",
+        minOutRaw: "48620748107948378162",
+        quoteAsset: "eth",
+      },
+      route: {
+        source: "uniswap",
+        kind: "usdg",
+        priceImpactBps: 9,
+        // Placeholder addresses on purpose. The assertions below read hop count and fee, never
+        // the pair, and the real WETH/USDG/token addresses trip the secret scanner's generic
+        // rule ("token" beside 40 hex chars). Low-entropy stand-ins say what they are.
+        hops: [
+          {
+            exchange: "uniswap-v3",
+            tokenIn: "0x0000000000000000000000000000000000000001",
+            tokenOut: "0x0000000000000000000000000000000000000002",
+            sharePct: 100,
+            fee: 500,
+          },
+          {
+            exchange: "uniswap-v3",
+            tokenIn: "0x0000000000000000000000000000000000000002",
+            tokenOut: "0x0000000000000000000000000000000000000003",
+            sharePct: 100,
+            fee: 3000,
+          },
+        ],
+      },
+    }
+    const { client } = makeClient(KEYED, [json(200, result)])
+    const out = await client.buildTrade({
+      clientTradeId: "trade-hood-route",
+      mint: "0x385f4f8ae47651ce5f58f5265395a669f8281e18",
+      side: "buy",
+      amountRaw: "2000000000000000",
+      payer: { type: "main" },
+      quoteAsset: "eth",
+    })
+    if (out.status !== "executed") throw new Error("expected executed")
+    // Settlement and route are different questions, and both must survive the round trip:
+    // the wallet paid ETH while the path crossed USDG.
+    expect(out.amounts.quoteAsset).toBe("eth")
+    expect(out.route?.source).toBe("uniswap")
+    expect(out.route?.kind).toBe("usdg")
+    expect(out.route?.hops).toHaveLength(2)
+    expect(out.route?.hops[0]?.fee).toBe(500)
+  })
+
+  test("buildTrade omits quoteAsset from the request body when not provided, so the server default applies", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-5",
+      chain: "solana",
+      signature: "Sig555",
+      fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+      amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: BuildTradeRequest = {
+      clientTradeId: "trade-5",
+      mint: "Mint111",
+      side: "buy",
+      amountRaw: "1000000",
+      payer: { type: "main" },
+    }
+    await client.buildTrade(req)
+    const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+    expect("quoteAsset" in sent).toBe(false)
+  })
+
+  test("confirmTrade (Solana): POST /api/v1/trade/agent/confirm with a signature", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-2",
+      chain: "solana",
+      signature: "Sig333",
+      feeSignature: "Sig333",
+      fee: { bps: 100, feeRaw: "2000", treasury: "TreasuryAddr1" },
+      amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: ConfirmTradeRequest = { clientTradeId: "trade-2", signature: "Sig333" }
+    const confirmResult = await client.confirmTrade(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/confirm",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(confirmResult).toEqual(result as never)
+  })
+
+  test("confirmTrade (Hood): POST with tradeTxHash and the required feeTxHash", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-3",
+      chain: "hood",
+      signature: "0xTradeHash",
+      feeSignature: "0xFeeHash",
+      fee: { bps: 100, feeRaw: "3000", treasury: "0xTreasury" },
+      amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "usdg" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: ConfirmTradeRequest = { clientTradeId: "trade-3", tradeTxHash: "0xTradeHash", feeTxHash: "0xFeeHash" }
+    const confirmResult = await client.confirmTrade(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/confirm",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(confirmResult).toEqual(result as never)
+  })
+
+  test("confirmTrade (Hood) without a fee omits feeTxHash from the body", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "trade-4",
+      chain: "hood",
+      signature: "0xTradeHash2",
+      fee: { bps: 0, feeRaw: "0", treasury: null },
+      amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "usdg" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: ConfirmTradeRequest = { clientTradeId: "trade-4", tradeTxHash: "0xTradeHash2" }
+    await client.confirmTrade(req)
+    const sent = JSON.parse(String(calls[0]?.body)) as Record<string, unknown>
+    expect("feeTxHash" in sent).toBe(false)
+  })
+
+  test("submit: POSTs the ordered signed legs to /api/v1/trade/agent/submit", async () => {
+    const result = {
+      success: true,
+      status: "executed",
+      clientTradeId: "cid",
+      chain: "solana",
+      signature: "Sig999",
+      feeSignature: "Sig999",
+      fee: { bps: 100, feeRaw: "2000", treasury: "TreasuryAddr1" },
+      amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+    }
+    const { client, calls } = makeClient(KEYED, [json(200, result)])
+    const req: SubmitTradeRequest = { clientTradeId: "cid", signedTransactions: ["legA", "legB"] }
+    const submitResult = await client.submit(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/trade/agent/submit",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(submitResult).toEqual(result as never)
+    expect(submitResult.status).toBe("executed")
+  })
+
+  test("buildTrade surfaces a structured error (SPEND_LIMIT_EXCEEDED) as CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [envelope(400, "SPEND_LIMIT_EXCEEDED", { retryable: false })])
+    const error = (await client
+      .buildTrade({
+        clientTradeId: "trade-5",
+        mint: "Mint111",
+        side: "buy",
+        amountRaw: "1000000",
+        payer: { type: "main" },
+      })
+      .catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("SPEND_LIMIT_EXCEEDED")
+  })
+
+  test("confirmTrade surfaces FEE_LEG_MISSING (402) as CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [envelope(402, "FEE_LEG_MISSING", { retryable: false })])
+    const error = (await client
+      .confirmTrade({ clientTradeId: "trade-5", tradeTxHash: "0xabc" })
+      .catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("FEE_LEG_MISSING")
+    expect(error.status).toBe(402)
+  })
+
+  test("public reads attach x-api-key when the client has one", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, market: {} })])
+    await client.getMarket("solana", "Mint111")
+    expect(calls[0]?.headers).toEqual({ "x-api-key": "cndl_test_key" })
+  })
+
+  test("a trailing slash on apiUrl does not double up", async () => {
+    const { calls, impl } = fakeFetch([json(200, { payload: { matrixVersion: 1, presets: [] } })])
+    const client = new CandleClient({ apiUrl: "https://api.test/", fetch: impl })
+    await client.getPresets()
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/launch/presets")
+  })
+})
+
+describe("atomic launch (build/submit request shapes, no linked signing)", () => {
+  const ATOMIC_BUILD_REQ: BuildAtomicLaunchRequest = {
+    clientLaunchId: "atomic-run-1",
+    chain: "solana",
+    name: "Atomic Coin",
+    symbol: "ATOM",
+    imageUrl: "https://example.com/atomic.png",
+    payer: { type: "main" },
+    firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+  }
+
+  const ATOMIC_BUILD_RESULT_ALL_SERVER = {
+    bundleId: "bundle-server-only",
+    legs: [
+      { index: 0, role: "launch", signer: "server" },
+      { index: 1, role: "buy", signer: "server", expectedFill: { amountOutRaw: "500000" } },
+    ],
+    expiresAt: 1692345678000,
+  }
+
+  test("buildAtomicLaunch: POST /api/v1/launch/atomic/build with key and JSON body", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, ATOMIC_BUILD_RESULT_ALL_SERVER)])
+    const result = await client.buildAtomicLaunch(ATOMIC_BUILD_REQ)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/atomic/build",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(ATOMIC_BUILD_REQ),
+    })
+    expect(result).toEqual({ ...ATOMIC_BUILD_RESULT_ALL_SERVER, clientLaunchId: "atomic-run-1" } as never)
+  })
+
+  test("buildAtomicLaunch generates a sdk- prefixed clientLaunchId when the caller omits one", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, ATOMIC_BUILD_RESULT_ALL_SERVER)])
+    const { clientLaunchId: _omitted, ...withoutId } = ATOMIC_BUILD_REQ
+    await client.buildAtomicLaunch(withoutId)
+    const sent = JSON.parse(String(calls[0]?.body)) as BuildAtomicLaunchRequest
+    expect(sent.clientLaunchId).toMatch(/^sdk-/)
+  })
+
+  test("submitAtomicLaunch: POSTs bundleId + signedTxsBase64 and returns the landed 200 result untouched", async () => {
+    const landed = { status: "landed", bundleId: "bundle-1", mint: "Mint111", signatures: ["Sig0", "Sig1"] }
+    const { client, calls } = makeClient(KEYED, [json(200, landed)])
+    const req: SubmitAtomicLaunchRequest = { bundleId: "bundle-1", signedTxsBase64: ["legA"] }
+    const result = await client.submitAtomicLaunch(req)
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/launch/atomic/submit",
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(req),
+    })
+    expect(result).toEqual(landed as never)
+  })
+
+  test("submitAtomicLaunch: a 502 failed outcome is RETURNED, not thrown", async () => {
+    const failed = { status: "failed", bundleId: "bundle-2", retryable: false }
+    const { client } = makeClient(KEYED, [json(502, failed)])
+    const result = await client.submitAtomicLaunch({ bundleId: "bundle-2", signedTxsBase64: [] })
+    expect(result).toEqual(failed as never)
+  })
+
+  test("submitAtomicLaunch: a 502 timeout outcome is RETURNED, not thrown, retryable reflects the resolution", async () => {
+    const timeoutRetryable = { status: "timeout", bundleId: "bundle-3", retryable: true }
+    const { client: client1 } = makeClient(KEYED, [json(502, timeoutRetryable)])
+    const result1 = await client1.submitAtomicLaunch({ bundleId: "bundle-3", signedTxsBase64: [] })
+    expect(result1).toEqual(timeoutRetryable as never)
+
+    // retryable: false (the "ambiguous" resolution -- see task-4-report.md) is a DIFFERENT value,
+    // not a default; both must survive the parse untouched.
+    const timeoutNotRetryable = { status: "timeout", bundleId: "bundle-4", retryable: false }
+    const { client: client2 } = makeClient(KEYED, [json(502, timeoutNotRetryable)])
+    const result2 = await client2.submitAtomicLaunch({ bundleId: "bundle-4", signedTxsBase64: [] })
+    expect(result2).toEqual(timeoutNotRetryable as never)
+  })
+
+  test("submitAtomicLaunch: every OTHER non-2xx status still throws CandleApiError (structured errorBody codes)", async () => {
+    const { client } = makeClient(KEYED, [envelope(404, "JOB_NOT_FOUND", { retryable: false })])
+    const error = (await client
+      .submitAtomicLaunch({ bundleId: "unknown-bundle", signedTxsBase64: [] })
+      .catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("JOB_NOT_FOUND")
+    expect(error.status).toBe(404)
+  })
+
+  test("submitAtomicLaunch: a genuine non-envelope 502 (not this route's own shape) still throws CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [new Response("upstream blew up", { status: 502 })])
+    const error = (await client
+      .submitAtomicLaunch({ bundleId: "bundle-5", signedTxsBase64: [] })
+      .catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("HTTP_502")
+  })
+
+  test("submitAtomicLaunch: an unexpected 200 response shape throws instead of being silently trusted", async () => {
+    const { client } = makeClient(KEYED, [json(200, { success: true, foo: "bar" })])
+    await expect(client.submitAtomicLaunch({ bundleId: "bundle-6", signedTxsBase64: [] })).rejects.toThrow(
+      /unexpected 200 response shape/,
+    )
+  })
+
+  test("submitAtomicLaunch: a malformed 200 'landed' body (missing mint/signatures) is REJECTED by the outcome guard, not silently trusted", async () => {
+    const { client } = makeClient(KEYED, [json(200, { status: "landed", bundleId: "bundle-7" })])
+    await expect(client.submitAtomicLaunch({ bundleId: "bundle-7", signedTxsBase64: [] })).rejects.toThrow(
+      /unexpected 200 response shape/,
+    )
+  })
+
+  test("submitAtomicLaunch: a malformed 502 body (retryable is not a boolean) is REJECTED by the outcome guard, still throws CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [json(502, { status: "timeout", bundleId: "bundle-8", retryable: "yes" })])
+    const error = (await client
+      .submitAtomicLaunch({ bundleId: "bundle-8", signedTxsBase64: [] })
+      .catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("HTTP_502")
+  })
+
+  test("buildAtomicLaunch surfaces a structured error (TIER_REQUIRED) as CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [envelope(403, "TIER_REQUIRED", { retryable: false })])
+    const error = (await client.buildAtomicLaunch(ATOMIC_BUILD_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("TIER_REQUIRED")
+  })
+
+  test("buildAtomicLaunch surfaces KEY_LIMIT_REACHED (403, with resetsAt) as CandleApiError", async () => {
+    const { client } = makeClient(KEYED, [
+      json(403, {
+        success: false,
+        error: {
+          code: "KEY_LIMIT_REACHED",
+          message: "firstBuys[0]: this key's transaction volume cap would be exceeded by this buy",
+          retryable: true,
+          resetsAt: 1755302400000,
+        },
+      }),
+    ])
+    const error = (await client.buildAtomicLaunch(ATOMIC_BUILD_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("KEY_LIMIT_REACHED")
+    expect(error.retryable).toBe(true)
+  })
+
+  test("launchAtomic(): a server-legs-only bundle (every payer 'main') skips the signing round entirely, no secretStore/privyAppId needed", async () => {
+    const landed = { status: "landed", bundleId: "bundle-server-only", mint: "Mint111", signatures: ["Sig0", "Sig1"] }
+    // No secretStore, no privyAppId in KEYED -- proves this path never touches either.
+    const { client, calls } = makeClient(KEYED, [json(200, ATOMIC_BUILD_RESULT_ALL_SERVER), json(200, landed)])
+    const req: LaunchAtomicRequest = {
+      ...ATOMIC_BUILD_REQ,
+      payer: { type: "main" },
+      firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+    }
+    const result = await client.launchAtomic(req)
+    expect(result).toEqual({ ...landed, clientLaunchId: "atomic-run-1" } as never)
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://api.test/api/v1/launch/atomic/build",
+      "https://api.test/api/v1/launch/atomic/submit",
+    ])
+    const submitSent = JSON.parse(String(calls[1]?.body)) as SubmitAtomicLaunchRequest
+    expect(submitSent).toEqual({ bundleId: "bundle-server-only", signedTxsBase64: [] })
+  })
+
+  test("launchAtomic(): a server-legs-only bundle that fails is returned, not thrown", async () => {
+    const failed = { status: "failed", bundleId: "bundle-server-only", retryable: false }
+    const { client } = makeClient(KEYED, [json(200, ATOMIC_BUILD_RESULT_ALL_SERVER), json(502, failed)])
+    const req: LaunchAtomicRequest = {
+      ...ATOMIC_BUILD_REQ,
+      payer: { type: "main" },
+      firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+    }
+    const result = await client.launchAtomic(req)
+    expect(result).toEqual({ ...failed, clientLaunchId: "atomic-run-1" } as never)
+  })
+
+  test("launchAtomic(): a server-legs-only bundle that times out is returned, not thrown", async () => {
+    const timedOut = { status: "timeout", bundleId: "bundle-server-only", retryable: true }
+    const { client } = makeClient(KEYED, [json(200, ATOMIC_BUILD_RESULT_ALL_SERVER), json(502, timedOut)])
+    const req: LaunchAtomicRequest = {
+      ...ATOMIC_BUILD_REQ,
+      payer: { type: "main" },
+      firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+    }
+    const result = await client.launchAtomic(req)
+    expect(result).toEqual({ ...timedOut, clientLaunchId: "atomic-run-1" } as never)
+  })
+})
+
+describe("linked-wallet signing relay + one-shot flows", () => {
+  const PRIVY_APP_ID = "app-test-123"
+  const SOLANA_RPC = "https://rpc.test/solana"
+  const EVM_RPC = "https://rpc.test/evm"
+  const LINKED_WALLET_ID = "wallet-123"
+  const PRIVY_WALLET_ID = "privy-wallet-123"
+  const SIGN_RELAY_URL = `https://api.test/api/v1/agent/wallets/${LINKED_WALLET_ID}/sign`
+
+  async function keyedSecretStore(): Promise<SecretStore> {
+    const store = new InMemorySecretStore()
+    const { privateKeyPem } = await generateSignerKeypair()
+    await store.set(LINKED_WALLET_ID, privateKeyPem)
+    return store
+  }
+
+  function solanaRpcOk(result: string): Response {
+    return json(200, { jsonrpc: "2.0", id: 1, result })
+  }
+
+  /** Same shape as solanaRpcOk, but `result` may be a string (call) or an object/null (callRaw). */
+  function evmRpcOk(result: unknown): Response {
+    return json(200, { jsonrpc: "2.0", id: 1, result })
+  }
+
+  /**
+   * The four RPC round trips every Hood one-shot leg-loop makes ONCE up front, before touching any
+   * leg: eth_chainId, eth_getTransactionCount("pending") (nonce 5), eth_maxPriorityFeePerGas, and
+   * eth_getBlockByNumber("latest") (for the base fee). Order matches fetchChainId -> fetchNonce ->
+   * fetchFeeData in client.ts's Hood branches.
+   */
+  function evmSetupResponses(): Response[] {
+    return [
+      evmRpcOk("0x2105"), // eth_chainId = 8453
+      evmRpcOk("0x5"), // eth_getTransactionCount -> nonce 5
+      evmRpcOk("0x3b9aca00"), // eth_maxPriorityFeePerGas = 1 gwei
+      evmRpcOk({ baseFeePerGas: "0x77359400" }), // eth_getBlockByNumber -> base fee 2 gwei
+    ]
+  }
+
+  /** The four calls one signed+broadcast+confirmed EVM leg makes: estimateGas, sign, broadcast, receipt. */
+  function evmLegResponses(txHash: string): Response[] {
+    return [
+      evmRpcOk("0x186a0"), // eth_estimateGas
+      json(200, SIGN_RELAY_OK), // POST .../sign
+      evmRpcOk(txHash), // eth_sendRawTransaction
+      evmRpcOk({ status: "0x1" }), // eth_getTransactionReceipt
+    ]
+  }
+
+  const BUILD_TRADE_REQ = { mint: "Mint111", side: "buy" as const, amountRaw: "1000000" }
+
+  const SOLANA_BUILT_TRADE = {
+    success: true,
+    status: "built",
+    clientTradeId: "trade-linked-1",
+    chain: "solana",
+    artifacts: {
+      venue: "curve",
+      transactionBase64: "AQADABc5unsigned",
+      quoteAsset: "sol",
+      quoteMint: "So11111111111111111111111111111111111111112",
+      quoteDecimals: 9,
+    },
+    fee: { bps: 100, feeRaw: "2000", treasury: "TreasuryAddr1" },
+    expectedOutRaw: "500000",
+    minOutRaw: "495000",
+    expiresAt: 1692345678000,
+  }
+
+  const HOOD_WALLET_ADDRESS = "0xLinkedWa11etAddress1"
+
+  const HOOD_BUILT_TRADE = {
+    success: true,
+    status: "built",
+    clientTradeId: "trade-linked-2",
+    chain: "hood",
+    walletAddress: HOOD_WALLET_ADDRESS,
+    artifacts: {
+      venue: "curve",
+      trade: { to: "0xCurve456", data: "0xtrade", value: "0" },
+      quoteAsset: "usdg",
+      quoteDecimals: 18,
+    },
+    fee: { bps: 0, feeRaw: "0", treasury: null },
+    expectedOutRaw: "700000",
+    minOutRaw: "693000",
+    expiresAt: 1692345678000,
+  }
+
+  const HOOD_BUILT_TRADE_WITH_APPROVAL = {
+    success: true,
+    status: "built",
+    clientTradeId: "trade-linked-3",
+    chain: "hood",
+    walletAddress: HOOD_WALLET_ADDRESS,
+    artifacts: {
+      venue: "curve",
+      approval: { to: "0xToken789", data: "0xapprove" },
+      trade: { to: "0xCurve456", data: "0xtrade", value: "0" },
+      feeTransfer: { to: "0xTreasury1", data: "0xfeetransfer", value: "0" },
+      quoteAsset: "usdg",
+      quoteDecimals: 18,
+    },
+    fee: { bps: 100, feeRaw: "7000", treasury: "0xTreasury1" },
+    expectedOutRaw: "700000",
+    minOutRaw: "693000",
+    expiresAt: 1692345678000,
+  }
+
+  /** A v4 sell: the token approves Permit2, then Permit2 grants the Universal Router. All four legs. */
+  const HOOD_BUILT_TRADE_WITH_PERMIT2 = {
+    success: true,
+    status: "built",
+    clientTradeId: "trade-linked-4",
+    chain: "hood",
+    walletAddress: HOOD_WALLET_ADDRESS,
+    artifacts: {
+      venue: "dex",
+      approval: { to: "0xToken789", data: "0xapprove" },
+      permit2Approval: { to: "0xPermit2", data: "0xpermit2approve" },
+      trade: { to: "0xRouter1", data: "0xtrade", value: "0" },
+      feeTransfer: { to: "0xTreasury1", data: "0xfeetransfer", value: "0" },
+      quoteAsset: "eth",
+      quoteDecimals: 18,
+    },
+    fee: { bps: 100, feeRaw: "7000", treasury: "0xTreasury1" },
+    expectedOutRaw: "700000",
+    minOutRaw: "693000",
+    expiresAt: 1692345678000,
+  }
+
+  /** The ERC-20 allowance to Permit2 already exists, so only the Permit2 grant is built. No fee. */
+  const HOOD_BUILT_TRADE_PERMIT2_ONLY = {
+    success: true,
+    status: "built",
+    clientTradeId: "trade-linked-5",
+    chain: "hood",
+    walletAddress: HOOD_WALLET_ADDRESS,
+    artifacts: {
+      venue: "dex",
+      permit2Approval: { to: "0xPermit2", data: "0xpermit2approve" },
+      trade: { to: "0xRouter1", data: "0xtrade", value: "0" },
+      quoteAsset: "eth",
+      quoteDecimals: 18,
+    },
+    fee: { bps: 0, feeRaw: "0", treasury: null },
+    expectedOutRaw: "700000",
+    minOutRaw: "693000",
+    expiresAt: 1692345678000,
+  }
+
+  const SIGN_RELAY_OK = { success: true, signedTransaction: "c2lnbmVkLXR4", encoding: "base64" }
+
+  const CONFIRMED_TRADE = {
+    success: true,
+    status: "executed",
+    clientTradeId: "trade-linked-1",
+    chain: "solana",
+    signature: "BroadcastSig111",
+    feeSignature: "BroadcastSig111",
+    fee: { bps: 100, feeRaw: "2000", treasury: "TreasuryAddr1" },
+    amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+  }
+
+  describe("signLinkedTransaction", () => {
+    test("Solana: loads the PEM, computes a signature, and calls the relay with the right body", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient({ ...KEYED, privyAppId: PRIVY_APP_ID, secretStore: store }, [
+        json(200, SIGN_RELAY_OK),
+      ])
+      const result = await client.signLinkedTransaction({
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+        chain: "solana",
+        unsignedTransactionBase64: "AQADABc5unsigned",
+      })
+      expect(result).toEqual({ signedTransaction: "c2lnbmVkLXR4", encoding: "base64" })
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe(SIGN_RELAY_URL)
+      expect(calls[0]?.method).toBe("POST")
+      const sent = JSON.parse(String(calls[0]?.body)) as { authorizationSignature: string; body: unknown }
+      expect(sent.body).toEqual({
+        method: "signTransaction",
+        params: { transaction: "AQADABc5unsigned", encoding: "base64" },
+      })
+      expect(typeof sent.authorizationSignature).toBe("string")
+      expect(sent.authorizationSignature.length).toBeGreaterThan(0)
+    })
+
+    test("a missing SecretStore key throws a clear error naming the wallet, without calling the relay", async () => {
+      const { client, calls } = makeClient(
+        { ...KEYED, privyAppId: PRIVY_APP_ID, secretStore: new InMemorySecretStore() },
+        [],
+      )
+      await expect(
+        client.signLinkedTransaction({
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+          chain: "solana",
+          unsignedTransactionBase64: "AQADABc5unsigned",
+        }),
+      ).rejects.toThrow(new RegExp(LINKED_WALLET_ID))
+      expect(calls).toHaveLength(0)
+    })
+
+    test("a missing privyAppId throws a clear error naming the option, without calling the relay or SecretStore", async () => {
+      const store = await keyedSecretStore()
+      let getCalls = 0
+      const spyStore: SecretStore = {
+        get: async (ref) => {
+          getCalls++
+          return store.get(ref)
+        },
+        set: (ref, pem) => store.set(ref, pem),
+        delete: (ref) => store.delete(ref),
+      }
+      const { client, calls } = makeClient({ ...KEYED, secretStore: spyStore }, [])
+      await expect(
+        client.signLinkedTransaction({
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+          chain: "solana",
+          unsignedTransactionBase64: "AQADABc5unsigned",
+        }),
+      ).rejects.toThrow(/privyAppId/)
+      expect(calls).toHaveLength(0)
+      expect(getCalls).toBe(0)
+    })
+
+    test("a missing secretStore throws a clear error naming the option", async () => {
+      const { client, calls } = makeClient({ ...KEYED, privyAppId: PRIVY_APP_ID }, [])
+      await expect(
+        client.signLinkedTransaction({
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+          chain: "solana",
+          unsignedTransactionBase64: "AQADABc5unsigned",
+        }),
+      ).rejects.toThrow(/secretStore/)
+      expect(calls).toHaveLength(0)
+    })
+
+    test('chain "solana" without unsignedTransactionBase64 throws a clear error, without calling the relay', async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient({ ...KEYED, privyAppId: PRIVY_APP_ID, secretStore: store }, [])
+      await expect(
+        client.signLinkedTransaction({
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+          chain: "solana",
+        }),
+      ).rejects.toThrow(/unsignedTransactionBase64/)
+      expect(calls).toHaveLength(0)
+    })
+
+    test('chain "evm" without evmTxParams throws a clear error, without calling the relay', async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient({ ...KEYED, privyAppId: PRIVY_APP_ID, secretStore: store }, [])
+      await expect(
+        client.signLinkedTransaction({
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+          chain: "evm",
+        }),
+      ).rejects.toThrow(/evmTxParams/)
+      expect(calls).toHaveLength(0)
+    })
+  })
+
+  describe("broadcastSignedTransaction", () => {
+    test("Solana: POSTs sendTransaction to solanaRpcUrl and returns the signature", async () => {
+      const { client, calls } = makeClient({ solanaRpcUrl: SOLANA_RPC }, [solanaRpcOk("BroadcastSig111")])
+      const signature = await client.broadcastSignedTransaction("solana", "c2lnbmVkLXR4", "base64")
+      expect(signature).toBe("BroadcastSig111")
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe(SOLANA_RPC)
+      const sent = JSON.parse(String(calls[0]?.body)) as { method: string; params: unknown[] }
+      expect(sent.method).toBe("sendTransaction")
+      expect(sent.params).toEqual(["c2lnbmVkLXR4", { encoding: "base64" }])
+    })
+
+    test("EVM: POSTs eth_sendRawTransaction to evmRpcUrl and returns the tx hash", async () => {
+      const { client, calls } = makeClient({ evmRpcUrl: EVM_RPC }, [
+        json(200, { jsonrpc: "2.0", id: 1, result: "0xTxHash" }),
+      ])
+      const txHash = await client.broadcastSignedTransaction("evm", "0xSignedRlp", "hex")
+      expect(txHash).toBe("0xTxHash")
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe(EVM_RPC)
+      const sent = JSON.parse(String(calls[0]?.body)) as { method: string; params: unknown[] }
+      expect(sent.method).toBe("eth_sendRawTransaction")
+      expect(sent.params).toEqual(["0xSignedRlp"])
+    })
+
+    test("throws when solanaRpcUrl is unset", async () => {
+      const { client, calls } = makeClient({}, [])
+      await expect(client.broadcastSignedTransaction("solana", "c2lnbmVkLXR4", "base64")).rejects.toThrow(
+        /solanaRpcUrl/,
+      )
+      expect(calls).toHaveLength(0)
+    })
+
+    test("throws when evmRpcUrl is unset", async () => {
+      const { client, calls } = makeClient({}, [])
+      await expect(client.broadcastSignedTransaction("evm", "0xSignedRlp", "hex")).rejects.toThrow(/evmRpcUrl/)
+      expect(calls).toHaveLength(0)
+    })
+
+    test("throws a clear error naming the RPC method when the result is missing", async () => {
+      const { client } = makeClient({ solanaRpcUrl: SOLANA_RPC }, [json(200, { jsonrpc: "2.0", id: 1 })])
+      await expect(client.broadcastSignedTransaction("solana", "c2lnbmVkLXR4", "base64")).rejects.toThrow(
+        /sendTransaction/,
+      )
+    })
+
+    test("throws a clear error naming the RPC method when the result is non-string", async () => {
+      const { client } = makeClient({ evmRpcUrl: EVM_RPC }, [
+        json(200, { jsonrpc: "2.0", id: 1, result: { hash: "0xTxHash" } }),
+      ])
+      await expect(client.broadcastSignedTransaction("evm", "0xSignedRlp", "hex")).rejects.toThrow(
+        /eth_sendRawTransaction/,
+      )
+    })
+
+    test("a JSON-RPC error envelope throws a structured JsonRpcError carrying .code and .data (not a flattened message)", async () => {
+      const { client } = makeClient({ solanaRpcUrl: SOLANA_RPC }, [
+        json(200, {
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            code: -32002,
+            message: "Transaction simulation failed",
+            data: { err: "BlockhashNotFound", logs: ["a", "b"] },
+          },
+        }),
+      ])
+      const error = await client.broadcastSignedTransaction("solana", "c2lnbmVkLXR4", "base64").catch((e) => e)
+      expect(error).toBeInstanceOf(JsonRpcError)
+      const rpcError = error as JsonRpcError
+      expect(rpcError.code).toBe(-32002)
+      expect(rpcError.data).toEqual({ err: "BlockhashNotFound", logs: ["a", "b"] })
+    })
+
+    test("a broadcast JSON-RPC error inlines data.err and the LAST logs into the thrown message", async () => {
+      const { client } = makeClient({ solanaRpcUrl: SOLANA_RPC }, [
+        json(200, {
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            code: -32002,
+            message: "Transaction simulation failed: Blockhash not found",
+            data: {
+              err: "BlockhashNotFound",
+              logs: ["Program log: A", "Program log: B", "Program log: C", "Program log: D"],
+            },
+          },
+        }),
+      ])
+      const error = await client.broadcastSignedTransaction("solana", "c2lnbmVkLXR4", "base64").catch((e) => e)
+      expect(error).toBeInstanceOf(JsonRpcError)
+      const rpcError = error as JsonRpcError
+      expect(rpcError.code).toBe(-32002)
+      // the human RPC message is preserved verbatim (isBlockhashExpiry's regex depends on it)
+      expect(rpcError.message).toContain("Transaction simulation failed: Blockhash not found")
+      // the structured cause is now inlined so the message is self-explaining
+      expect(rpcError.message).toContain("BlockhashNotFound")
+      /*
+        The TAIL. An aggregator-built transaction opens with ComputeBudget frames, so a head
+        slice reliably spent the preview on boilerplate and cut off the frame that actually
+        failed -- reported by an integrator on 2026-08-27 who had exactly that in their logs.
+      */
+      expect(rpcError.message).toContain("Program log: D")
+      expect(rpcError.message).not.toContain("Program log: A")
+      // still bounded, not an unbounded dump; the full array stays on .data.logs
+      expect((rpcError.data as { logs: string[] }).logs).toHaveLength(4)
+      // structured data is still attached, unchanged
+      expect((rpcError.data as { err: string }).err).toBe("BlockhashNotFound")
+    })
+  })
+
+  describe("trade()", () => {
+    test('from: "main" takes the existing inline path and never calls the relay or SecretStore', async () => {
+      const executed = {
+        success: true,
+        status: "executed",
+        clientTradeId: "trade-main-1",
+        chain: "solana",
+        signature: "Sig222",
+        fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+        amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+      }
+      let getCalls = 0
+      const spyStore: SecretStore = {
+        get: async () => {
+          getCalls++
+          return null
+        },
+        set: async () => {},
+        delete: async () => {},
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: spyStore, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [json(200, executed)],
+      )
+      const result = await client.trade({ ...BUILD_TRADE_REQ, from: "main" })
+      expect(result).toEqual(executed as never)
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.url).toBe("https://api.test/api/v1/trade/agent/build")
+      const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+      expect(sent.payer).toEqual({ type: "main" })
+      expect(getCalls).toBe(0)
+    })
+
+    test('from: "main" forwards quoteAsset into the build request when provided', async () => {
+      const executed = {
+        success: true,
+        status: "executed",
+        clientTradeId: "trade-main-2",
+        chain: "solana",
+        signature: "Sig223",
+        fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+        amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "cndl" },
+      }
+      const { client, calls } = makeClient(KEYED, [json(200, executed)])
+      const result = await client.trade({ ...BUILD_TRADE_REQ, from: "main", quoteAsset: "cndl" })
+      expect(result).toEqual(executed as never)
+      const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+      expect(sent.quoteAsset).toBe("cndl")
+    })
+
+    test('from: "main" sends no quoteAsset in the build request when not provided, so the server default applies', async () => {
+      const executed = {
+        success: true,
+        status: "executed",
+        clientTradeId: "trade-main-3",
+        chain: "solana",
+        signature: "Sig224",
+        fee: { bps: 50, feeRaw: "1000", treasury: "TreasuryAddr1" },
+        amounts: { amountRaw: "1000000", expectedOutRaw: "500000", minOutRaw: "495000", quoteAsset: "sol" },
+      }
+      const { client, calls } = makeClient(KEYED, [json(200, executed)])
+      const result = await client.trade({ ...BUILD_TRADE_REQ, from: "main" })
+      expect(result).toEqual(executed as never)
+      const sent = JSON.parse(String(calls[0]?.body)) as BuildTradeRequest
+      expect("quoteAsset" in sent).toBe(false)
+    })
+
+    test("from: linked (Solana) defaults to build -> sign -> submit, needing no solanaRpcUrl, and returns the executed result", async () => {
+      const store = await keyedSecretStore()
+      // No solanaRpcUrl in these options at all: the default path never reads it.
+      const { client, calls } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID }, [
+        json(200, SOLANA_BUILT_TRADE),
+        json(200, SIGN_RELAY_OK),
+        json(200, CONFIRMED_TRADE),
+      ])
+      const result = await client.trade({
+        ...BUILD_TRADE_REQ,
+        from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+      })
+      expect(result).toEqual(CONFIRMED_TRADE as never)
+      // build -> sign -> submit, in that order -- no client-side broadcast call at all.
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/trade/agent/build",
+        SIGN_RELAY_URL,
+        "https://api.test/api/v1/trade/agent/submit",
+      ])
+      const submitSent = JSON.parse(String(calls[2]?.body)) as SubmitTradeRequest
+      expect(submitSent).toEqual({
+        clientTradeId: SOLANA_BUILT_TRADE.clientTradeId,
+        signedTransactions: [SIGN_RELAY_OK.signedTransaction],
+      })
+      // The default path does not call confirmTrade -- submit() already broadcasts and confirms.
+      expect(calls.some((c) => c.url === "https://api.test/api/v1/trade/agent/confirm")).toBe(false)
+    })
+
+    test("lower-level path: explicit buildTrade -> signLinkedTransaction -> broadcastSignedTransaction -> confirmTrade (Solana) is unchanged, the opt-in client-broadcast route", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [
+          json(200, SOLANA_BUILT_TRADE),
+          json(200, SIGN_RELAY_OK),
+          solanaRpcOk("BroadcastSig111"),
+          json(200, CONFIRMED_TRADE),
+        ],
+      )
+      const built = await client.buildTrade({
+        clientTradeId: SOLANA_BUILT_TRADE.clientTradeId,
+        mint: "Mint111",
+        side: "buy",
+        amountRaw: "1000000",
+        payer: { type: "linked", linkedWalletId: LINKED_WALLET_ID },
+      })
+      if (built.status !== "built" || built.chain !== "solana") {
+        throw new Error("expected a built Solana trade")
+      }
+      const signed = await client.signLinkedTransaction({
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+        chain: "solana",
+        unsignedTransactionBase64: built.artifacts.transactionBase64,
+      })
+      const signature = await client.broadcastSignedTransaction("solana", signed.signedTransaction, signed.encoding)
+      const confirmed = await client.confirmTrade({ clientTradeId: built.clientTradeId, signature })
+      expect(confirmed).toEqual(CONFIRMED_TRADE as never)
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/trade/agent/build",
+        SIGN_RELAY_URL,
+        SOLANA_RPC,
+        "https://api.test/api/v1/trade/agent/confirm",
+      ])
+      const confirmSent = JSON.parse(String(calls[3]?.body)) as ConfirmTradeRequest
+      expect(confirmSent).toEqual({ clientTradeId: SOLANA_BUILT_TRADE.clientTradeId, signature: "BroadcastSig111" })
+    })
+
+    test("from: linked (Hood) with an approval leg runs approval -> trade -> feeTransfer in order, sequential nonces, a receipt awaited between legs, and confirms with tradeTxHash + feeTxHash", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = {
+        success: true,
+        status: "executed",
+        clientTradeId: HOOD_BUILT_TRADE_WITH_APPROVAL.clientTradeId,
+        chain: "hood",
+        signature: "0xTradeTxHash",
+        feeSignature: "0xFeeTxHash",
+        fee: HOOD_BUILT_TRADE_WITH_APPROVAL.fee,
+        amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "usdg" },
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, HOOD_BUILT_TRADE_WITH_APPROVAL), // build
+          ...evmSetupResponses(), // chainId, nonce, feeData
+          ...evmLegResponses("0xApprovalTxHash"), // leg 0: approval
+          ...evmLegResponses("0xTradeTxHash"), // leg 1: trade
+          ...evmLegResponses("0xFeeTxHash"), // leg 2: feeTransfer
+          json(200, confirmed), // confirm
+        ],
+      )
+      const result = await client.trade({
+        mint: "0xMint",
+        side: "buy",
+        amountRaw: "500000",
+        from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+      })
+      expect(result).toEqual(confirmed as never)
+
+      const signCalls = calls.filter((c) => c.url === SIGN_RELAY_URL)
+      expect(signCalls).toHaveLength(3)
+      const transactions = signCalls.map(
+        (c) =>
+          (JSON.parse(String(c.body)) as { body: { params: { transaction: EvmSignTransactionParams } } }).body.params
+            .transaction,
+      )
+      // Sequential nonces N, N+1, N+2 off the fetched base nonce (5), in leg order.
+      expect(transactions.map((tx) => tx.nonce)).toEqual([5, 6, 7])
+      // The approval leg hits the token contract; the trade and feeTransfer legs hit curve/treasury.
+      expect(transactions.map((tx) => tx.to)).toEqual(["0xToken789", "0xCurve456", "0xTreasury1"])
+      for (const tx of transactions) {
+        expect(tx.type).toBe(2)
+        expect(typeof tx.nonce).toBe("number")
+        expect(typeof tx.chain_id).toBe("number")
+        expect(tx.chain_id).toBe(8453)
+        expect(tx.value.startsWith("0x")).toBe(true)
+        expect(tx.gas_limit.startsWith("0x")).toBe(true)
+        expect(tx.max_fee_per_gas.startsWith("0x")).toBe(true)
+        expect(tx.max_priority_fee_per_gas.startsWith("0x")).toBe(true)
+      }
+
+      // Each leg's receipt (eth_getTransactionReceipt) is awaited before the next leg's
+      // eth_estimateGas: the full ordered call list is build, 4 setup calls, then 4 calls per leg
+      // (estimateGas, sign, broadcast, receipt) x3, then confirm -- never all three legs' RPC
+      // calls fired together.
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/trade/agent/build",
+        EVM_RPC, // eth_chainId
+        EVM_RPC, // eth_getTransactionCount
+        EVM_RPC, // eth_maxPriorityFeePerGas
+        EVM_RPC, // eth_getBlockByNumber
+        EVM_RPC, // approval: eth_estimateGas
+        SIGN_RELAY_URL,
+        EVM_RPC, // approval: eth_sendRawTransaction
+        EVM_RPC, // approval: eth_getTransactionReceipt
+        EVM_RPC, // trade: eth_estimateGas
+        SIGN_RELAY_URL,
+        EVM_RPC, // trade: eth_sendRawTransaction
+        EVM_RPC, // trade: eth_getTransactionReceipt
+        EVM_RPC, // feeTransfer: eth_estimateGas
+        SIGN_RELAY_URL,
+        EVM_RPC, // feeTransfer: eth_sendRawTransaction
+        EVM_RPC, // feeTransfer: eth_getTransactionReceipt
+        "https://api.test/api/v1/trade/agent/confirm",
+      ])
+
+      const confirmCall = calls[calls.length - 1]
+      const confirmSent = JSON.parse(String(confirmCall?.body)) as ConfirmTradeRequest
+      expect(confirmSent).toEqual({
+        clientTradeId: HOOD_BUILT_TRADE_WITH_APPROVAL.clientTradeId,
+        tradeTxHash: "0xTradeTxHash",
+        feeTxHash: "0xFeeTxHash",
+      })
+    })
+
+    test("from: linked (Hood) whose fee transfer throws AFTER the trade landed reports the landed trade, never a bare error", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, HOOD_BUILT_TRADE_WITH_APPROVAL), // build
+          ...evmSetupResponses(),
+          ...evmLegResponses("0xApprovalTxHash"),
+          ...evmLegResponses("0xTradeTxHash"),
+          // feeTransfer: eth_estimateGas fails
+          json(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "insufficient funds for fee" } }),
+        ],
+      )
+      const err = await client
+        .trade({
+          mint: "0xMint",
+          side: "buy",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        )
+      expect(err).toBeInstanceOf(TradeLandedFeeLegError)
+      expect(err).toMatchObject({
+        stage: "executed",
+        tradeTxHash: "0xTradeTxHash",
+        clientTradeId: HOOD_BUILT_TRADE_WITH_APPROVAL.clientTradeId,
+        feeOutcome: "not-broadcast",
+      })
+      expect((err as TradeLandedFeeLegError).feeTxHash).toBeUndefined()
+      expect((err as Error).message).toContain("trade executed; fee/booking incomplete")
+      expect((err as Error).message).toContain("Do NOT repeat the trade")
+      expect((err as Error).message).toContain("pay the fee")
+      expect((err as Error).message).not.toContain("Do NOT pay again")
+      expect((err as Error).message).toContain("insufficient funds for fee")
+      // Nothing was confirmed or rebuilt on the way out.
+      expect(calls.some((c) => c.url === "https://api.test/api/v1/trade/agent/confirm")).toBe(false)
+    })
+
+    test("a known Hood fee hash is kept when the receipt read, the receipt wait, or the send is not a definite rejection", async () => {
+      const signedFee = "c2lnbmVkLXR4"
+      let predicted = ""
+      for (const b of keccak_256(Buffer.from(signedFee, "base64"))) predicted += b.toString(16).padStart(2, "0")
+      const predictedHash = `0x${predicted}`
+      const rpcError = (message: string, code = -32000) =>
+        json(200, { jsonrpc: "2.0", id: 1, error: { code, message } })
+      const cases: [string, (Response | Error)[], string][] = [
+        [
+          "receipt-read failure",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), evmRpcOk("0xFeeTxHash"), rpcError("header not found")],
+          "0xFeeTxHash",
+        ],
+        [
+          "timeout",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), evmRpcOk("0xFeeTxHash"), evmRpcOk(null)],
+          "0xFeeTxHash",
+        ],
+        ["ambiguous send", [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("already known")], predictedHash],
+        [
+          "proxy lost upstream result",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("upstream connection reset")],
+          predictedHash,
+        ],
+        [
+          "internal error",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("Internal error", -32603)],
+          predictedHash,
+        ],
+        [
+          "server error",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("Server error", -32001)],
+          predictedHash,
+        ],
+        ["send timeout", [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("request timed out")], predictedHash],
+        [
+          "nonce already mined",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), rpcError("nonce too low")],
+          predictedHash,
+        ],
+        [
+          "lost transport response",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), new TypeError("fetch failed: connection closed after send")],
+          predictedHash,
+        ],
+        [
+          "proxy HTTP failure",
+          [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK), new Response("Bad Gateway", { status: 502 })],
+          predictedHash,
+        ],
+        [
+          "proxy mentions rejection",
+          [
+            evmRpcOk("0x186a0"),
+            json(200, SIGN_RELAY_OK),
+            rpcError("upstream unavailable while checking insufficient funds for gas * price + value"),
+          ],
+          predictedHash,
+        ],
+      ]
+      for (const [label, feeResponses, feeHash] of cases) {
+        const store = await keyedSecretStore()
+        if (label === "timeout") __setEvmReceiptWaitForTest({ timeoutMs: 0, pollMs: 1 })
+        try {
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+            [
+              json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+              ...evmSetupResponses(),
+              ...evmLegResponses("0xApprovalTxHash"),
+              ...evmLegResponses("0xTradeTxHash"),
+              ...feeResponses,
+            ],
+          )
+          const err = await client
+            .trade({
+              mint: "0xMint",
+              side: "buy",
+              amountRaw: "500000",
+              from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+            })
+            .then(
+              () => null,
+              (e: unknown) => e,
+            )
+          expect(err, label).toBeInstanceOf(TradeLandedFeeLegError)
+          expect(err, label).toMatchObject({
+            stage: "executed",
+            feeOutcome: "unknown",
+            tradeTxHash: "0xTradeTxHash",
+            feeTxHash: feeHash,
+            clientTradeId: HOOD_BUILT_TRADE_WITH_APPROVAL.clientTradeId,
+          })
+          const message = (err as Error).message
+          expect(message, label).toContain("trade executed; fee/booking incomplete")
+          expect(message, label).toContain("Do NOT repeat the trade")
+          expect(message, label).toContain("Do NOT pay again")
+          expect(message.toLowerCase(), label).not.toContain("pay the fee")
+          expect(message, label).toContain(feeHash)
+          expect(message, label).toContain(HOOD_BUILT_TRADE_WITH_APPROVAL.clientTradeId)
+          const sends = calls.filter((c) => {
+            if (c.url !== EVM_RPC) return false
+            return JSON.parse(String(c.body)).method === "eth_sendRawTransaction"
+          })
+          expect(sends, label).toHaveLength(3)
+          expect(JSON.parse(String(sends[2]?.body)).params).toEqual([signedFee])
+          expect(
+            calls.some((c) => c.url === "https://api.test/api/v1/trade/agent/confirm"),
+            label,
+          ).toBe(false)
+        } finally {
+          __setEvmReceiptWaitForTest(null)
+        }
+      }
+    })
+
+    test("explicit Hood fee send rejections still report not-broadcast", async () => {
+      for (const message of ["insufficient funds for gas * price + value", "intrinsic gas too low", "invalid sender"]) {
+        const store = await keyedSecretStore()
+        const { client, calls } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+          [
+            json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+            ...evmSetupResponses(),
+            ...evmLegResponses("0xApprovalTxHash"),
+            ...evmLegResponses("0xTradeTxHash"),
+            evmRpcOk("0x186a0"),
+            json(200, SIGN_RELAY_OK),
+            json(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message } }),
+          ],
+        )
+        const err = await client
+          .trade({
+            mint: "0xMint",
+            side: "buy",
+            amountRaw: "500000",
+            from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+          })
+          .then(
+            () => null,
+            (e: unknown) => e,
+          )
+        expect(err, message).toBeInstanceOf(TradeLandedFeeLegError)
+        expect(err, message).toMatchObject({
+          stage: "executed",
+          tradeTxHash: "0xTradeTxHash",
+          feeOutcome: "not-broadcast",
+        })
+        expect((err as TradeLandedFeeLegError).feeTxHash, message).toBeUndefined()
+        expect((err as Error).message).toContain("pay the fee")
+        expect((err as Error).message).not.toContain("Do NOT pay again")
+        expect(calls.at(-1)?.body).toContain("eth_sendRawTransaction")
+      }
+    })
+
+    test("a reverted Hood fee receipt still says to pay, and keeps the reverted hash", async () => {
+      const store = await keyedSecretStore()
+      const { client } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC }, [
+        json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+        ...evmSetupResponses(),
+        ...evmLegResponses("0xApprovalTxHash"),
+        ...evmLegResponses("0xTradeTxHash"),
+        evmRpcOk("0x186a0"),
+        json(200, SIGN_RELAY_OK),
+        evmRpcOk("0xFeeTxHash"),
+        evmRpcOk({ status: "0x0" }),
+      ])
+      const err = await client
+        .trade({
+          mint: "0xMint",
+          side: "buy",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        )
+      expect(err).toBeInstanceOf(TradeLandedFeeLegError)
+      expect(err).toMatchObject({
+        stage: "executed",
+        feeOutcome: "reverted",
+        tradeTxHash: "0xTradeTxHash",
+        feeTxHash: "0xFeeTxHash",
+      })
+      expect((err as Error).message).toContain("pay the fee")
+      expect((err as Error).message).not.toContain("Do NOT pay again")
+    })
+
+    test("T16: trade fails before signing after an approval landed: keep its hash and the original cause", async () => {
+      const store = await keyedSecretStore()
+      const { client } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC }, [
+        json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+        ...evmSetupResponses(),
+        ...evmLegResponses("0xApprovalTxHash"),
+        json(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "execution reverted" } }),
+      ])
+      const err = await client
+        .trade({
+          mint: "0xMint",
+          side: "buy",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        )
+      expect(err).not.toBeInstanceOf(TradeLandedFeeLegError)
+      expect(err).toBeInstanceOf(TradeLegOutcomeError)
+      expect((err as TradeLegOutcomeError).cause).toBeInstanceOf(JsonRpcError)
+      expect((err as TradeLegOutcomeError).landedLegs).toEqual([{ leg: "approval", txHash: "0xApprovalTxHash" }])
+      expect((err as Error).message).toContain("execution reverted")
+    })
+
+    test.each([
+      "broadcast",
+      "timeout",
+      "reverted",
+    ])("T17/T18: trade %s keeps signed hash and landed approval", async (failure) => {
+      const store = await keyedSecretStore()
+      const setup: (Response | Error)[] = [
+        json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+        ...evmSetupResponses(),
+        ...evmLegResponses("0xApprovalTxHash"),
+        evmRpcOk("0x186a0"),
+        json(200, SIGN_RELAY_OK),
+      ]
+      if (failure === "broadcast") setup.push(new Error("lost broadcast response"))
+      else {
+        setup.push(evmRpcOk("0xTradeHash"))
+        setup.push(failure === "reverted" ? evmRpcOk({ status: "0x0" }) : evmRpcOk(null))
+      }
+      __setEvmReceiptWaitForTest({ timeoutMs: 1, pollMs: 1 })
+      try {
+        const { client } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+          setup,
+        )
+        const error = await client
+          .trade({
+            mint: "0xMint",
+            side: "buy",
+            amountRaw: "500000",
+            from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+          })
+          .catch((e) => e)
+        expect(error).toBeInstanceOf(TradeLegOutcomeError)
+        expect(error.leg).toBe("trade")
+        expect(error.outcome).toBe(failure === "reverted" ? "reverted" : "unknown")
+        expect(error.txHash).toBe(
+          failure === "broadcast"
+            ? "0x" + Buffer.from(keccak_256(Buffer.from(SIGN_RELAY_OK.signedTransaction, "base64"))).toString("hex")
+            : "0xTradeHash",
+        )
+        expect(error.landedLegs).toEqual([{ leg: "approval", txHash: "0xApprovalTxHash" }])
+        expect(operationIds(error)).toEqual({ clientTradeId: error.clientTradeId })
+        expect(error.cause).toBeInstanceOf(Error)
+      } finally {
+        __setEvmReceiptWaitForTest(null)
+      }
+    })
+    test("T19: first-leg pre-sign JsonRpcError retains its class", async () => {
+      const store = await keyedSecretStore()
+      const { client } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC }, [
+        json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+        ...evmSetupResponses(),
+        json(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "estimate failed" } }),
+      ])
+      const error = await client
+        .trade({
+          mint: "0xMint",
+          side: "buy",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        })
+        .catch((e) => e)
+      expect(error).toBeInstanceOf(JsonRpcError)
+      expect(error).not.toBeInstanceOf(TradeLegOutcomeError)
+    })
+    test.each([
+      false,
+      true,
+    ])("T20/T21: all landed, confirm response lost=%s preserves hashes and original cause", async (lost) => {
+      const store = await keyedSecretStore()
+      const cause = new Error("lost confirmation")
+      const { client } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC }, [
+        json(200, HOOD_BUILT_TRADE_WITH_APPROVAL),
+        ...evmSetupResponses(),
+        ...evmLegResponses("0xApproval"),
+        ...evmLegResponses("0xTrade"),
+        ...evmLegResponses("0xFee"),
+        lost
+          ? cause
+          : json(404, { success: false, error: { code: "JOB_NOT_FOUND", message: "row failed", retryable: false } }),
+      ])
+      const error = await client
+        .trade({
+          mint: "0xMint",
+          side: "buy",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        })
+        .catch((e) => e)
+      expect(error).toBeInstanceOf(TradeLandedUnconfirmedError)
+      expect(error).toMatchObject({ tradeTxHash: "0xTrade", feeTxHash: "0xFee", stage: "executed" })
+      expect(error.cause).toBeInstanceOf(lost ? Error : CandleApiError)
+      if (lost) expect(error.cause).toBe(cause)
+      expect(operationIds(error)).toEqual({ clientTradeId: error.clientTradeId })
+      expect(error.message).toContain("Read getTradeJob")
+      expect(error.message).toContain("do not retry or rebuild")
+    })
+
+    test("from: linked (Hood) with no approval and no fee leg confirms with just tradeTxHash", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = {
+        success: true,
+        status: "executed",
+        clientTradeId: HOOD_BUILT_TRADE.clientTradeId,
+        chain: "hood",
+        signature: "0xTradeTxHash",
+        fee: HOOD_BUILT_TRADE.fee,
+        amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "usdg" },
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, HOOD_BUILT_TRADE),
+          ...evmSetupResponses(),
+          ...evmLegResponses("0xTradeTxHash"),
+          json(200, confirmed),
+        ],
+      )
+      const result = await client.trade({
+        mint: "0xMint",
+        side: "sell",
+        amountRaw: "500000",
+        from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+      })
+      expect(result).toEqual(confirmed as never)
+
+      const confirmCall = calls[calls.length - 1]
+      const confirmSent = JSON.parse(String(confirmCall?.body)) as ConfirmTradeRequest
+      expect(confirmSent).toEqual({ clientTradeId: HOOD_BUILT_TRADE.clientTradeId, tradeTxHash: "0xTradeTxHash" })
+      expect("feeTxHash" in confirmSent).toBe(false)
+
+      // build, 4 setup calls, 4 leg calls, confirm -- nothing extra (no approval, no fee leg).
+      expect(calls).toHaveLength(10)
+    })
+
+    /** Labels each recorded call: the JSON-RPC method for an EVM RPC call, else "sign" or the URL. */
+    function callLabels(calls: { url: string; body?: unknown }[]): string[] {
+      return calls.map((c) => {
+        if (c.url === EVM_RPC) return (JSON.parse(String(c.body)) as { method: string }).method
+        if (c.url === SIGN_RELAY_URL) return "sign"
+        return c.url
+      })
+    }
+
+    function signedTransactions(calls: { url: string; body?: unknown }[]): EvmSignTransactionParams[] {
+      return calls
+        .filter((c) => c.url === SIGN_RELAY_URL)
+        .map(
+          (c) =>
+            (JSON.parse(String(c.body)) as { body: { params: { transaction: EvmSignTransactionParams } } }).body.params
+              .transaction,
+        )
+    }
+
+    const LEG_CALLS = ["eth_estimateGas", "sign", "eth_sendRawTransaction", "eth_getTransactionReceipt"]
+
+    test("from: linked (Hood) with all four legs sends permit2Approval between approval and trade, nonces 5-8, and confirms with the trade and fee hashes", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = {
+        success: true,
+        status: "executed",
+        clientTradeId: HOOD_BUILT_TRADE_WITH_PERMIT2.clientTradeId,
+        chain: "hood",
+        signature: "0xTradeTxHash",
+        feeSignature: "0xFeeTxHash",
+        fee: HOOD_BUILT_TRADE_WITH_PERMIT2.fee,
+        amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "eth" },
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, HOOD_BUILT_TRADE_WITH_PERMIT2),
+          ...evmSetupResponses(),
+          ...evmLegResponses("0xApprovalTxHash"),
+          ...evmLegResponses("0xPermit2TxHash"),
+          ...evmLegResponses("0xTradeTxHash"),
+          ...evmLegResponses("0xFeeTxHash"),
+          json(200, confirmed),
+        ],
+      )
+      const result = await client.trade({
+        mint: "0xMint",
+        side: "sell",
+        amountRaw: "500000",
+        from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+      })
+      expect(result).toEqual(confirmed as never)
+
+      const transactions = signedTransactions(calls)
+      expect(transactions.map((tx) => tx.to)).toEqual(["0xToken789", "0xPermit2", "0xRouter1", "0xTreasury1"])
+      expect(transactions.map((tx) => tx.nonce)).toEqual([5, 6, 7, 8])
+      expect(transactions[1]?.data).toBe("0xpermit2approve")
+      expect(transactions[1]?.value).toBe("0x0")
+
+      // Strictly sequential: the Permit2 leg's receipt lands before the trade leg's estimateGas,
+      // which is the call that reverts while the Permit2 allowance is unset.
+      expect(callLabels(calls)).toEqual([
+        "https://api.test/api/v1/trade/agent/build",
+        "eth_chainId",
+        "eth_getTransactionCount",
+        "eth_maxPriorityFeePerGas",
+        "eth_getBlockByNumber",
+        ...LEG_CALLS, // approval
+        ...LEG_CALLS, // permit2Approval
+        ...LEG_CALLS, // trade
+        ...LEG_CALLS, // feeTransfer
+        "https://api.test/api/v1/trade/agent/confirm",
+      ])
+      const estimates = calls
+        .filter((c) => c.url === EVM_RPC)
+        .map((c) => JSON.parse(String(c.body)) as { method: string; params: { to: string }[] })
+        .filter((b) => b.method === "eth_estimateGas")
+      expect(estimates.map((b) => b.params[0]?.to)).toEqual(["0xToken789", "0xPermit2", "0xRouter1", "0xTreasury1"])
+
+      const confirmSent = JSON.parse(String(calls[calls.length - 1]?.body)) as ConfirmTradeRequest
+      expect(confirmSent).toEqual({
+        clientTradeId: HOOD_BUILT_TRADE_WITH_PERMIT2.clientTradeId,
+        tradeTxHash: "0xTradeTxHash",
+        feeTxHash: "0xFeeTxHash",
+      })
+    })
+
+    test("from: linked (Hood) with permit2Approval but no approval sends Permit2 first at the base nonce, and confirms with just tradeTxHash", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = {
+        success: true,
+        status: "executed",
+        clientTradeId: HOOD_BUILT_TRADE_PERMIT2_ONLY.clientTradeId,
+        chain: "hood",
+        signature: "0xTradeTxHash",
+        fee: HOOD_BUILT_TRADE_PERMIT2_ONLY.fee,
+        amounts: { amountRaw: "500000", expectedOutRaw: "700000", minOutRaw: "693000", quoteAsset: "eth" },
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, HOOD_BUILT_TRADE_PERMIT2_ONLY),
+          ...evmSetupResponses(),
+          ...evmLegResponses("0xPermit2TxHash"),
+          ...evmLegResponses("0xTradeTxHash"),
+          json(200, confirmed),
+        ],
+      )
+      const result = await client.trade({
+        mint: "0xMint",
+        side: "sell",
+        amountRaw: "500000",
+        from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+      })
+      expect(result).toEqual(confirmed as never)
+
+      const transactions = signedTransactions(calls)
+      expect(transactions.map((tx) => tx.to)).toEqual(["0xPermit2", "0xRouter1"])
+      expect(transactions.map((tx) => tx.nonce)).toEqual([5, 6])
+
+      const confirmSent = JSON.parse(String(calls[calls.length - 1]?.body)) as ConfirmTradeRequest
+      expect(confirmSent).toEqual({
+        clientTradeId: HOOD_BUILT_TRADE_PERMIT2_ONLY.clientTradeId,
+        tradeTxHash: "0xTradeTxHash",
+      })
+      expect("feeTxHash" in confirmSent).toBe(false)
+
+      // build, 4 setup calls, 4 calls per leg x2, confirm.
+      expect(calls).toHaveLength(14)
+    })
+
+    test("from: linked (Hood) throws a clear error naming evmRpcUrl when unset, before any signing", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID }, [
+        json(200, HOOD_BUILT_TRADE),
+      ])
+      await expect(
+        client.trade({
+          mint: "0xMint",
+          side: "sell",
+          amountRaw: "500000",
+          from: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        }),
+      ).rejects.toThrow(/evmRpcUrl/)
+      // Only the build call happened -- no chain id / nonce / fee reads, no sign relay call.
+      expect(calls).toHaveLength(1)
+    })
+  })
+
+  describe.each(["selfLaunch", "launch"] as const)("%s TEE signing and recovery", (method) => {
+    const launchSelf = (client: CandleClient, req: SelfLaunchRequest) => {
+      if (method === "selfLaunch") return client.selfLaunch(req)
+      const { linkedWalletId, privyWalletId, ...fields } = req
+      return client.launch({ ...fields, wallet: { linkedWalletId, privyWalletId } })
+    }
+    const BUILD_SELF_LAUNCH_SOLANA = {
+      success: true,
+      transaction: "AQADABc5unsignedlaunch",
+      mint: "Mint111",
+      pool: "Pool111",
+      clientLaunchId: "run-linked-1",
+      expiresAt: 1692345678000,
+    }
+    const BUILD_SELF_LAUNCH_HOOD = {
+      success: true,
+      transaction: { to: "0xFactory123", data: "0xabcd1234" },
+      curveAddress: "0xCurve456",
+      clientLaunchId: "run-linked-2",
+      walletAddress: HOOD_WALLET_ADDRESS,
+      expiresAt: 1692345678000,
+    }
+
+    const BUILD_SELF_LAUNCH_HOOD_WITH_FEE = {
+      success: true,
+      transaction: { to: "0xFactory123", data: "0xabcd1234" },
+      curveAddress: "0xCurve456",
+      clientLaunchId: "run-linked-3",
+      walletAddress: HOOD_WALLET_ADDRESS,
+      feeTransfer: { to: "0xTreasury1", data: "0xfeetransfer", value: "0" },
+      fee: { bps: 100, feeRaw: "7000", treasury: "0xTreasury1" },
+      expiresAt: 1692345678000,
+    }
+
+    test("launch selects a named TEE wallet and signs, broadcasts and confirms", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [
+          json(200, {
+            page: [
+              {
+                id: LINKED_WALLET_ID,
+                privyWalletId: PRIVY_WALLET_ID,
+                address: "Address1",
+                label: "spider-01",
+                chain: "solana",
+              },
+            ],
+            isDone: true,
+          }),
+          json(200, BUILD_SELF_LAUNCH_SOLANA),
+          json(200, SIGN_RELAY_OK),
+          solanaRpcOk("BroadcastSig222"),
+          json(200, LAUNCH_OK),
+        ],
+      )
+      const result = await client.launch({ ...LAUNCH_REQ, wallet: "spider-01", clientLaunchId: "run-linked-1" })
+      expect(result.clientLaunchId).toBe("run-linked-1")
+      expect(calls.map((call) => call.url)).toEqual([
+        "https://api.test/api/v1/agent/wallets/trading",
+        "https://api.test/api/v1/launch/self/build",
+        SIGN_RELAY_URL,
+        SOLANA_RPC,
+        "https://api.test/api/v1/launch/self/confirm",
+      ])
+      expect(JSON.parse(String(calls[1]?.body))).toEqual({
+        ...LAUNCH_REQ,
+        clientLaunchId: "run-linked-1",
+        linkedWalletId: LINKED_WALLET_ID,
+      })
+    })
+
+    test("BE-1847: a creator bundle signs both legs and submits them together, with no RPC broadcast", async () => {
+      const store = await keyedSecretStore()
+      const built = {
+        bundleId: "creator-bundle",
+        mint: "Mint111",
+        pool: "Pool111",
+        legs: [
+          { index: 0, role: "launch", signer: "client", unsignedTxBase64: "bGF1bmNo" },
+          { index: 1, role: "buy", signer: "client", unsignedTxBase64: "YnV5" },
+        ],
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [
+          json(200, built),
+          json(200, SIGN_RELAY_OK),
+          json(200, SIGN_RELAY_OK),
+          json(200, {
+            status: "landed",
+            bundleId: built.bundleId,
+            mint: built.mint,
+            signatures: ["launch-sig", "buy-sig"],
+            launch: { ...LAUNCH_OK, devBuy: { signature: "buy-sig" } },
+          }),
+        ],
+      )
+      const result = await (method === "launch"
+        ? client.launch({
+            ...LAUNCH_REQ,
+            buy: "0.1",
+            wallet: { linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+          })
+        : launchSelf(client, {
+            ...LAUNCH_REQ,
+            buyAmount: "10000000",
+            linkedWalletId: LINKED_WALLET_ID,
+            privyWalletId: PRIVY_WALLET_ID,
+          }))
+      expect(JSON.parse(String(calls[0]?.body)).buyAmount).toBe(method === "launch" ? 100000000 : "10000000")
+      expect(result.devBuy?.signature).toBe("buy-sig")
+      expect(calls.map((c) => String(c.url).replace("https://api.test", ""))).toEqual([
+        "/api/v1/launch/self/build",
+        `/api/v1/agent/wallets/${LINKED_WALLET_ID}/sign`,
+        `/api/v1/agent/wallets/${LINKED_WALLET_ID}/sign`,
+        "/api/v1/launch/atomic/submit",
+      ])
+      expect(JSON.parse(String(calls[3]?.body))).toEqual({
+        bundleId: built.bundleId,
+        signedTxsBase64: [SIGN_RELAY_OK.signedTransaction, SIGN_RELAY_OK.signedTransaction],
+      })
+    })
+
+    test.each([
+      "timeout",
+      "failed",
+    ])("BE-1847: creator bundle %s retains both ids and never enters the RPC rebuild loop", async (status) => {
+      const store = await keyedSecretStore()
+      const built = {
+        bundleId: "creator-bundle",
+        mint: "Mint111",
+        pool: "Pool111",
+        legs: [
+          { index: 0, signer: "client", unsignedTxBase64: "bGF1bmNo" },
+          { index: 1, signer: "client", unsignedTxBase64: "YnV5" },
+        ],
+      }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [
+          json(200, built),
+          json(200, SIGN_RELAY_OK),
+          json(200, SIGN_RELAY_OK),
+          json(502, { status, bundleId: built.bundleId, retryable: false }),
+        ],
+      )
+      const error = await launchSelf(client, {
+        ...LAUNCH_REQ,
+        buyAmount: "10000000",
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+      }).catch((e) => e)
+      expect(error).toBeInstanceOf(CandleApiError)
+      expect(error.stage).toBe(status === "failed" ? "reverted" : "unconfirmed")
+      expect(operationIds(error)).toEqual({ clientLaunchId: LAUNCH_REQ.clientLaunchId, bundleId: built.bundleId })
+      expect(calls).toHaveLength(4)
+      expect(calls.some((c) => c.url === SOLANA_RPC)).toBe(false)
+    })
+
+    test("BE-1847: an older API's combined creator transaction is never signed or broadcast", async () => {
+      const { client, calls } = makeClient(KEYED, [json(200, BUILD_SELF_LAUNCH_SOLANA)])
+      const error = await launchSelf(client, {
+        ...LAUNCH_REQ,
+        buyAmount: "10000000",
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+      }).catch((e) => e)
+      expect(String(error)).toContain("bundle support")
+      expect(calls).toHaveLength(1)
+    })
+
+    test("Solana: runs build -> sign -> broadcast -> confirm in order and returns the confirmed launch", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+        [
+          json(200, BUILD_SELF_LAUNCH_SOLANA),
+          json(200, SIGN_RELAY_OK),
+          solanaRpcOk("BroadcastSig222"),
+          json(200, LAUNCH_OK),
+        ],
+      )
+      const result = await launchSelf(client, {
+        ...LAUNCH_REQ,
+        clientLaunchId: "run-linked-1",
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+      })
+      expect(result).toEqual({ ...LAUNCH_OK, clientLaunchId: "run-linked-1" } as never)
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/launch/self/build",
+        SIGN_RELAY_URL,
+        SOLANA_RPC,
+        "https://api.test/api/v1/launch/self/confirm",
+      ])
+      const confirmSent = JSON.parse(String(calls[3]?.body)) as { clientLaunchId: string; signature: string }
+      expect(confirmSent).toEqual({ clientLaunchId: "run-linked-1", signature: "BroadcastSig222" })
+    })
+
+    test("Hood: signs and broadcasts the createCurve tx (no approval leg, no dev buy) and confirms with { clientLaunchId, signature }", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = { ...LAUNCH_OK, chain: "hood", signature: "0xCreateCurveTxHash" }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, BUILD_SELF_LAUNCH_HOOD), // build
+          ...evmSetupResponses(), // chainId, nonce, feeData
+          ...evmLegResponses("0xCreateCurveTxHash"), // the single createCurve leg
+          json(200, confirmed), // confirm
+        ],
+      )
+      const result = await launchSelf(client, {
+        ...LAUNCH_REQ,
+        chain: "hood",
+        clientLaunchId: "run-linked-2",
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+      })
+      expect(result).toEqual({ ...confirmed, clientLaunchId: "run-linked-2" } as never)
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/launch/self/build",
+        EVM_RPC, // eth_chainId
+        EVM_RPC, // eth_getTransactionCount
+        EVM_RPC, // eth_maxPriorityFeePerGas
+        EVM_RPC, // eth_getBlockByNumber
+        EVM_RPC, // eth_estimateGas
+        SIGN_RELAY_URL,
+        EVM_RPC, // eth_sendRawTransaction
+        EVM_RPC, // eth_getTransactionReceipt
+        "https://api.test/api/v1/launch/self/confirm",
+      ])
+      const signCall = calls.find((c) => c.url === SIGN_RELAY_URL)
+      const tx = (JSON.parse(String(signCall?.body)) as { body: { params: { transaction: EvmSignTransactionParams } } })
+        .body.params.transaction
+      expect(tx.to).toBe("0xFactory123")
+      expect(tx.nonce).toBe(5)
+      expect(tx.type).toBe(2)
+
+      const confirmCall = calls[calls.length - 1]
+      const confirmSent = JSON.parse(String(confirmCall?.body)) as ConfirmSelfLaunchRequest
+      expect(confirmSent).toEqual({ clientLaunchId: "run-linked-2", signature: "0xCreateCurveTxHash" })
+      expect("feeTxHash" in confirmSent).toBe(false)
+    })
+
+    test("Hood: does the fee-transfer leg when present (nonce+1) and confirms with feeTxHash", async () => {
+      const store = await keyedSecretStore()
+      const confirmed = { ...LAUNCH_OK, chain: "hood", signature: "0xCreateCurveTxHash" }
+      const { client, calls } = makeClient(
+        { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+        [
+          json(200, BUILD_SELF_LAUNCH_HOOD_WITH_FEE),
+          ...evmSetupResponses(),
+          ...evmLegResponses("0xCreateCurveTxHash"), // createCurve leg
+          ...evmLegResponses("0xFeeTxHash"), // fee-transfer leg
+          json(200, confirmed),
+        ],
+      )
+      const result = await launchSelf(client, {
+        ...LAUNCH_REQ,
+        chain: "hood",
+        clientLaunchId: "run-linked-3",
+        linkedWalletId: LINKED_WALLET_ID,
+        privyWalletId: PRIVY_WALLET_ID,
+      })
+      expect(result).toEqual({ ...confirmed, clientLaunchId: "run-linked-3" } as never)
+
+      const signCalls = calls.filter((c) => c.url === SIGN_RELAY_URL)
+      const transactions = signCalls.map(
+        (c) =>
+          (JSON.parse(String(c.body)) as { body: { params: { transaction: EvmSignTransactionParams } } }).body.params
+            .transaction,
+      )
+      expect(transactions.map((tx) => tx.nonce)).toEqual([5, 6])
+      expect(transactions.map((tx) => tx.to)).toEqual(["0xFactory123", "0xTreasury1"])
+
+      const confirmCall = calls[calls.length - 1]
+      const confirmSent = JSON.parse(String(confirmCall?.body)) as ConfirmSelfLaunchRequest
+      expect(confirmSent).toEqual({
+        clientLaunchId: "run-linked-3",
+        signature: "0xCreateCurveTxHash",
+        feeTxHash: "0xFeeTxHash",
+      })
+    })
+
+    test("Hood: throws a clear error naming evmRpcUrl when unset, before any signing", async () => {
+      const store = await keyedSecretStore()
+      const { client, calls } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID }, [
+        json(200, BUILD_SELF_LAUNCH_HOOD),
+      ])
+      await expect(
+        launchSelf(client, {
+          ...LAUNCH_REQ,
+          chain: "hood",
+          clientLaunchId: "run-linked-2",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }),
+      ).rejects.toThrow(/evmRpcUrl/)
+      expect(calls).toHaveLength(1)
+    })
+
+    // BE-1412 (spec 2026-10-13-sdk-hood-self-launch-outcome-design.md, tests A1 to A9). Every
+    // case drives the public selfLaunch() promise, so a missing await or an operation wrapper
+    // around the typed error fails here.
+    describe("Hood: a failure after the curve landed keeps the id and every hash", () => {
+      const BUILD_URL = "https://api.test/api/v1/launch/self/build"
+      const CONFIRM_URL = "https://api.test/api/v1/launch/self/confirm"
+      const CREATE_CURVE_HASH = "0xCreateCurveTxHash"
+      const FEE_HASH = "0xFeeTxHash"
+      /** keccak256 of the relay's signed bytes: the hash a lost or refused send still names. */
+      const SIGNED_FEE_HASH = `0x${Buffer.from(keccak_256(Buffer.from(SIGN_RELAY_OK.signedTransaction, "base64"))).toString("hex")}`
+      const CONFIRMED = { ...LAUNCH_OK, chain: "hood", signature: CREATE_CURVE_HASH }
+
+      const rpcError = (message: string, code = -32000) =>
+        json(200, { jsonrpc: "2.0", id: 1, error: { code, message } })
+      /** The fee leg's estimateGas and sign, both answered: what comes next is the send. */
+      const feeSigned = (): Response[] => [evmRpcOk("0x186a0"), json(200, SIGN_RELAY_OK)]
+
+      function counts(calls: RecordedRequest[]) {
+        const rpcMethods = calls
+          .filter((c) => c.url === EVM_RPC)
+          .map((c) => (JSON.parse(String(c.body)) as { method: string }).method)
+        return {
+          builds: calls.filter((c) => c.url === BUILD_URL).length,
+          signs: calls.filter((c) => c.url === SIGN_RELAY_URL).length,
+          sends: rpcMethods.filter((m) => m === "eth_sendRawTransaction").length,
+          confirms: calls.filter((c) => c.url === CONFIRM_URL).length,
+        }
+      }
+
+      /** Runs selfLaunch() through a mined create-curve leg, then `afterCreateCurve`. */
+      async function launchPastCreateCurve(
+        build: typeof BUILD_SELF_LAUNCH_HOOD | typeof BUILD_SELF_LAUNCH_HOOD_WITH_FEE,
+        afterCreateCurve: (Response | Error)[],
+      ) {
+        const store = await keyedSecretStore()
+        const { client, calls } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+          [json(200, build), ...evmSetupResponses(), ...evmLegResponses(CREATE_CURVE_HASH), ...afterCreateCurve],
+        )
+        const error: unknown = await launchSelf(client, {
+          ...LAUNCH_REQ,
+          chain: "hood",
+          clientLaunchId: build.clientLaunchId,
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }).then(
+          () => null,
+          (e: unknown) => e,
+        )
+        return { client, calls, error }
+      }
+
+      /** The typed error, thrown directly: never inside a CandleOperationError. */
+      function outcomeError(error: unknown, label = ""): SelfLaunchOutcomeError {
+        expect(error, label).toBeInstanceOf(SelfLaunchOutcomeError)
+        expect(error, label).not.toBeInstanceOf(CandleOperationError)
+        const typed = error as SelfLaunchOutcomeError
+        expect(typed.name, label).toBe("SelfLaunchOutcomeError")
+        expect(typed.chain, label).toBe("hood")
+        expect(typed.stage, label).toBe("executed")
+        expect(typed.createCurveTxHash, label).toBe(CREATE_CURVE_HASH)
+        expect("retryable" in typed, label).toBe(false)
+        expect(typed.message, label).toContain("the Hood curve is on chain")
+        expect(typed.message, label).toContain(CREATE_CURVE_HASH)
+        expect(typed.message, label).toContain("Do NOT call selfLaunch() or buildSelfLaunch() again")
+        return typed
+      }
+
+      test("A1: fee estimation or fee signing rejects: not-broadcast, no hash, no confirm, no second send", async () => {
+        const cases: [string, (Response | Error)[], (cause: unknown) => void][] = [
+          [
+            "estimateGas",
+            [rpcError("insufficient funds for fee")],
+            (cause) => {
+              expect(cause).toBeInstanceOf(JsonRpcError)
+              expect((cause as JsonRpcError).code).toBe(-32000)
+            },
+          ],
+          [
+            "sign relay",
+            [evmRpcOk("0x186a0"), envelope(403, "SIGN_REFUSED", { message: "the relay refused this transaction" })],
+            (cause) => {
+              expect(cause).toBeInstanceOf(CandleApiError)
+              expect(cause).toMatchObject({ code: "SIGN_REFUSED", status: 403, retryable: false })
+            },
+          ],
+        ]
+        for (const [label, feeResponses, expectCause] of cases) {
+          const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, feeResponses)
+          const typed = outcomeError(error, label)
+          expect(typed, label).toMatchObject({
+            clientLaunchId: "run-linked-3",
+            step: "feeTransfer",
+            feeOutcome: "not-broadcast",
+          })
+          expect("feeTxHash" in typed, label).toBe(false)
+          expectCause(typed.cause)
+          expect(typed.message, label).toContain("did NOT pay")
+          expect(typed.message, label).not.toContain("MAY have paid")
+          // Only the create-curve send went out, and the fee was signed at most once.
+          expect(counts(calls), label).toEqual({
+            builds: 1,
+            signs: label === "sign relay" ? 2 : 1,
+            sends: 1,
+            confirms: 0,
+          })
+        }
+      })
+
+      test("A2: a refused fee send keeps the signed hash as not-broadcast; a reverted receipt keeps its hash as reverted", async () => {
+        for (const message of [
+          "insufficient funds for gas * price + value",
+          "intrinsic gas too low",
+          "invalid sender",
+        ]) {
+          const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [
+            ...feeSigned(),
+            rpcError(message),
+          ])
+          const typed = outcomeError(error, message)
+          expect(typed, message).toMatchObject({
+            clientLaunchId: "run-linked-3",
+            step: "feeTransfer",
+            feeOutcome: "not-broadcast",
+            feeTxHash: SIGNED_FEE_HASH,
+          })
+          expect(typed.cause, message).toBeInstanceOf(JsonRpcError)
+          expect(typed.message, message).toContain("did NOT pay")
+          expect(typed.message, message).toContain("names the refused transaction, not a payment")
+          expect(counts(calls), message).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 0 })
+        }
+
+        const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [
+          ...feeSigned(),
+          evmRpcOk(FEE_HASH),
+          evmRpcOk({ status: "0x0" }),
+        ])
+        const typed = outcomeError(error)
+        expect(typed).toMatchObject({ step: "feeTransfer", feeOutcome: "reverted", feeTxHash: FEE_HASH })
+        expect(typed.message).toContain("did NOT pay")
+        expect(typed.message).toContain("its receipt reverted")
+        expect(typed.message).not.toContain("MAY have paid")
+        expect(counts(calls)).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 0 })
+      })
+
+      test("A3: an ambiguous fee send, a failed receipt read and a receipt timeout are unknown, with the hash, and are never resent or confirmed", async () => {
+        const lost = new TypeError("fetch failed: connection closed after send")
+        const cases: [string, (Response | Error)[], string][] = [
+          ["already known", [...feeSigned(), rpcError("already known")], SIGNED_FEE_HASH],
+          ["nonce too low", [...feeSigned(), rpcError("nonce too low")], SIGNED_FEE_HASH],
+          ["internal error", [...feeSigned(), rpcError("Internal error", -32603)], SIGNED_FEE_HASH],
+          ["lost transport response", [...feeSigned(), lost], SIGNED_FEE_HASH],
+          ["proxy HTTP failure", [...feeSigned(), new Response("Bad Gateway", { status: 502 })], SIGNED_FEE_HASH],
+          ["receipt read rejects", [...feeSigned(), evmRpcOk(FEE_HASH), rpcError("header not found")], FEE_HASH],
+          ["receipt timeout", [...feeSigned(), evmRpcOk(FEE_HASH), evmRpcOk(null)], FEE_HASH],
+        ]
+        for (const [label, feeResponses, feeHash] of cases) {
+          if (label === "receipt timeout") __setEvmReceiptWaitForTest({ timeoutMs: 0, pollMs: 1 })
+          try {
+            const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, feeResponses)
+            const typed = outcomeError(error, label)
+            expect(typed, label).toMatchObject({
+              clientLaunchId: "run-linked-3",
+              step: "feeTransfer",
+              feeOutcome: "unknown",
+              feeTxHash: feeHash,
+            })
+            if (label === "lost transport response") expect(typed.cause).toBe(lost)
+            else expect(typed.cause, label).toBeInstanceOf(Error)
+            expect(typed.message, label).toContain("MAY have paid")
+            expect(typed.message, label).toContain("Do NOT pay it again")
+            expect(typed.message, label).toContain(feeHash)
+            expect(typed.message, label).not.toContain("did NOT pay")
+            // The fee was sent once, with the bytes the relay signed, and nothing followed it
+            // but the receipt read: no resend, no confirm, no rebuild.
+            expect(counts(calls), label).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 0 })
+            const sends = calls.filter(
+              (c) => c.url === EVM_RPC && JSON.parse(String(c.body)).method === "eth_sendRawTransaction",
+            )
+            expect(JSON.parse(String(sends[1]?.body)).params, label).toEqual([SIGN_RELAY_OK.signedTransaction])
+          } finally {
+            __setEvmReceiptWaitForTest(null)
+          }
+        }
+      })
+
+      test("A4: the fee landed and confirm's fetch rejects: both hashes, step confirm, landed, the original cause", async () => {
+        const lost = new TypeError("fetch failed: socket hang up")
+        const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [
+          ...evmLegResponses(FEE_HASH),
+          lost,
+        ])
+        const typed = outcomeError(error)
+        expect(typed).toMatchObject({
+          clientLaunchId: "run-linked-3",
+          step: "confirm",
+          feeOutcome: "landed",
+          feeTxHash: FEE_HASH,
+        })
+        expect(typed.cause).toBe(lost)
+        // The answer may have been lost after booking: the message sends the caller to the job
+        // read and the same hashes, and never says the launch is unrecorded.
+        expect(typed.message).toContain("may or may not have recorded the launch")
+        expect(typed.message).toContain("getLaunchJob(clientLaunchId)")
+        expect(typed.message).toContain(`The fee transfer landed (feeTxHash ${FEE_HASH})`)
+        expect(typed.message).not.toContain("is not recorded")
+        expect(counts(calls)).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 1 })
+        expect(calls.at(-1)?.url).toBe(CONFIRM_URL)
+        expect(JSON.parse(String(calls.at(-1)?.body))).toEqual({
+          clientLaunchId: "run-linked-3",
+          signature: CREATE_CURVE_HASH,
+          feeTxHash: FEE_HASH,
+        })
+      })
+
+      test("A4: a confirm rejection that is not an Error is kept as the cause, untouched", async () => {
+        const store = await keyedSecretStore()
+        const queued = fakeFetch([
+          json(200, BUILD_SELF_LAUNCH_HOOD_WITH_FEE),
+          ...evmSetupResponses(),
+          ...evmLegResponses(CREATE_CURVE_HASH),
+          ...evmLegResponses(FEE_HASH),
+        ])
+        const rejection = { reason: "aborted by the host" }
+        const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+          if (String(input) === CONFIRM_URL) throw rejection
+          return queued.impl(input as never, init)
+        }) as unknown as typeof fetch
+        const client = new CandleClient({
+          apiUrl: "https://api.test",
+          fetch: fetchImpl,
+          ...KEYED,
+          secretStore: store,
+          privyAppId: PRIVY_APP_ID,
+          evmRpcUrl: EVM_RPC,
+        })
+        const error: unknown = await launchSelf(client, {
+          ...LAUNCH_REQ,
+          chain: "hood",
+          clientLaunchId: "run-linked-3",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }).then(
+          () => null,
+          (e: unknown) => e,
+        )
+        const typed = outcomeError(error)
+        expect(typed).toMatchObject({ step: "confirm", feeOutcome: "landed", feeTxHash: FEE_HASH })
+        expect(typed.cause).toBe(rejection)
+      })
+
+      test("A5: a structured confirm refusal or a malformed confirm answer keeps the same fields, and the API details stay on cause", async () => {
+        const refusals: [string, Response, Record<string, unknown>][] = [
+          [
+            "FEE_LEG_MISSING",
+            envelope(402, "FEE_LEG_MISSING", { message: "the fee transfer could not be verified" }),
+            { code: "FEE_LEG_MISSING", status: 402, retryable: false },
+          ],
+          [
+            "JOB_NOT_FOUND",
+            envelope(404, "JOB_NOT_FOUND", { message: "no such launch" }),
+            { code: "JOB_NOT_FOUND", status: 404, retryable: false },
+          ],
+          [
+            "retryable VALIDATION_FAILED",
+            envelope(400, "VALIDATION_FAILED", { retryable: true, message: "retry /confirm" }),
+            { code: "VALIDATION_FAILED", status: 400, retryable: true },
+          ],
+        ]
+        for (const [label, refusal, details] of refusals) {
+          const { calls, error } = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [
+            ...evmLegResponses(FEE_HASH),
+            refusal,
+          ])
+          const typed = outcomeError(error, label)
+          expect(typed, label).toMatchObject({
+            clientLaunchId: "run-linked-3",
+            step: "confirm",
+            feeOutcome: "landed",
+            feeTxHash: FEE_HASH,
+          })
+          expect(typed.cause, label).toBeInstanceOf(CandleApiError)
+          expect(typed.cause, label).toMatchObject(details)
+          expect(counts(calls), label).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 1 })
+        }
+
+        const malformed = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [
+          ...evmLegResponses(FEE_HASH),
+          new Response("<html>gateway</html>", { status: 200 }),
+        ])
+        const typed = outcomeError(malformed.error)
+        expect(typed).toMatchObject({
+          clientLaunchId: "run-linked-3",
+          step: "confirm",
+          feeOutcome: "landed",
+          feeTxHash: FEE_HASH,
+        })
+        expect(typed.cause).toBeInstanceOf(SyntaxError)
+        expect(counts(malformed.calls)).toEqual({ builds: 1, signs: 2, sends: 2, confirms: 1 })
+      })
+
+      test("A6: a build with no fee leg whose confirm rejects is not-required, with no invented fee hash", async () => {
+        const refused = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD, [
+          envelope(503, "LAUNCH_FAILED", { retryable: true, message: "could not record the launch" }),
+        ])
+        const lost = new TypeError("fetch failed")
+        const dropped = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD, [lost])
+        for (const [label, { calls, error }] of [
+          ["refused", refused],
+          ["lost", dropped],
+        ] as const) {
+          const typed = outcomeError(error, label)
+          expect(typed, label).toMatchObject({
+            clientLaunchId: "run-linked-2",
+            step: "confirm",
+            feeOutcome: "not-required",
+          })
+          expect("feeTxHash" in typed, label).toBe(false)
+          expect(typed.message, label).toContain("This build had no fee transfer")
+          expect(typed.message, label).not.toContain("feeTxHash")
+          expect(counts(calls), label).toEqual({ builds: 1, signs: 1, sends: 1, confirms: 1 })
+          expect(JSON.parse(String(calls.at(-1)?.body)), label).toEqual({
+            clientLaunchId: "run-linked-2",
+            signature: CREATE_CURVE_HASH,
+          })
+        }
+        expect(refused.error).toMatchObject({ cause: { code: "LAUNCH_FAILED", status: 503, retryable: true } })
+        expect((dropped.error as SelfLaunchOutcomeError).cause).toBe(lost)
+      })
+
+      test("A7: a supplied and a generated id are both on the error, operationIds() reads them, and the package root exports the class", async () => {
+        // Supplied.
+        const supplied = await launchPastCreateCurve(BUILD_SELF_LAUNCH_HOOD_WITH_FEE, [rpcError("execution reverted")])
+        const mine = outcomeError(supplied.error)
+        expect(mine.clientLaunchId).toBe("run-linked-3")
+        expect(operationIds(mine)).toEqual({ clientLaunchId: "run-linked-3" })
+        expect(packageRoot.SelfLaunchOutcomeError).toBe(SelfLaunchOutcomeError)
+        expect(mine).toBeInstanceOf(packageRoot.SelfLaunchOutcomeError)
+        expect(packageRoot.operationIds(mine)).toEqual({ clientLaunchId: "run-linked-3" })
+
+        // Generated: the build answers with the id the request carried, as the server does.
+        const store = await keyedSecretStore()
+        const queued = fakeFetch([
+          ...evmSetupResponses(),
+          ...evmLegResponses(CREATE_CURVE_HASH),
+          ...evmLegResponses(FEE_HASH),
+          envelope(402, "FEE_LEG_MISSING"),
+        ])
+        let sentId = ""
+        const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+          if (String(input) !== BUILD_URL) return queued.impl(input as never, init)
+          sentId = (JSON.parse(String(init?.body)) as { clientLaunchId: string }).clientLaunchId
+          return json(200, { ...BUILD_SELF_LAUNCH_HOOD_WITH_FEE, clientLaunchId: sentId })
+        }) as unknown as typeof fetch
+        const client = new CandleClient({
+          apiUrl: "https://api.test",
+          fetch: fetchImpl,
+          ...KEYED,
+          secretStore: store,
+          privyAppId: PRIVY_APP_ID,
+          evmRpcUrl: EVM_RPC,
+        })
+        const { clientLaunchId: _omitted, ...withoutId } = LAUNCH_REQ
+        const error: unknown = await launchSelf(client, {
+          ...withoutId,
+          chain: "hood",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }).then(
+          () => null,
+          (e: unknown) => e,
+        )
+        const generated = outcomeError(error)
+        expect(sentId).toMatch(/^sdk-/)
+        expect(generated.clientLaunchId).toBe(sentId)
+        expect(generated).toMatchObject({ step: "confirm", feeOutcome: "landed", feeTxHash: FEE_HASH })
+        expect(operationIds(generated)).toEqual({ clientLaunchId: sentId })
+        expect(generated).toBeInstanceOf(packageRoot.SelfLaunchOutcomeError)
+        const confirmCall = queued.calls.at(-1)
+        expect(confirmCall?.url).toBe(CONFIRM_URL)
+        expect(JSON.parse(String(confirmCall?.body))).toEqual({
+          clientLaunchId: sentId,
+          signature: CREATE_CURVE_HASH,
+          feeTxHash: FEE_HASH,
+        })
+      })
+
+      test("A8: a confirm that committed and lost its answer is recovered with the error's id and hashes, with no build, sign or send", async () => {
+        for (const build of [BUILD_SELF_LAUNCH_HOOD_WITH_FEE, BUILD_SELF_LAUNCH_HOOD]) {
+          const label = build.clientLaunchId
+          const hasFee = "feeTransfer" in build
+          const { client, calls, error } = await launchPastCreateCurve(build, [
+            ...(hasFee ? evmLegResponses(FEE_HASH) : []),
+            new TypeError("fetch failed: the response was lost"),
+            json(200, CONFIRMED), // the stored success, replayed
+          ])
+          const typed = outcomeError(error, label)
+          const before = counts(calls)
+          expect(before, label).toEqual({ builds: 1, signs: hasFee ? 2 : 1, sends: hasFee ? 2 : 1, confirms: 1 })
+
+          const replayed = await client.confirmSelfLaunch({
+            clientLaunchId: typed.clientLaunchId,
+            signature: typed.createCurveTxHash,
+            ...(typed.feeTxHash ? { feeTxHash: typed.feeTxHash } : {}),
+          })
+          expect(replayed, label).toEqual({ ...CONFIRMED, clientLaunchId: build.clientLaunchId } as never)
+          expect(counts(calls), label).toEqual({ ...before, confirms: 2 })
+          // The recovery is one request, and it repeats the body selfLaunch() itself sent.
+          expect(calls.at(-1)?.url, label).toBe(CONFIRM_URL)
+          expect(calls.at(-1)?.body, label).toEqual(calls.at(-2)?.body)
+          expect(JSON.parse(String(calls.at(-1)?.body)), label).toEqual({
+            clientLaunchId: build.clientLaunchId,
+            signature: CREATE_CURVE_HASH,
+            ...(hasFee ? { feeTxHash: FEE_HASH } : {}),
+          })
+        }
+      })
+
+      test("A9: an error before the create-curve receipt keeps its old shape and is never a SelfLaunchOutcomeError", async () => {
+        async function failCreateCurve(createCurveResponses: (Response | Error)[]) {
+          const store = await keyedSecretStore()
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, evmRpcUrl: EVM_RPC },
+            [json(200, BUILD_SELF_LAUNCH_HOOD_WITH_FEE), ...evmSetupResponses(), ...createCurveResponses],
+          )
+          const error: unknown = await launchSelf(client, {
+            ...LAUNCH_REQ,
+            chain: "hood",
+            clientLaunchId: "run-linked-3",
+            linkedWalletId: LINKED_WALLET_ID,
+            privyWalletId: PRIVY_WALLET_ID,
+          }).then(
+            () => null,
+            (e: unknown) => e,
+          )
+          expect(error).not.toBeInstanceOf(SelfLaunchOutcomeError)
+          expect(operationIds(error)).toEqual({ clientLaunchId: "run-linked-3" })
+          expect(counts(calls).confirms).toBe(0)
+          return error
+        }
+
+        // Gas estimation: the JsonRpcError itself, with the id set on it.
+        const estimate = await failCreateCurve([rpcError("execution reverted")])
+        expect(estimate).toBeInstanceOf(JsonRpcError)
+
+        // A refused send: the same.
+        const refused = await failCreateCurve([...feeSigned(), rpcError("insufficient funds for gas * price + value")])
+        expect(refused).toBeInstanceOf(JsonRpcError)
+
+        // A reverted create-curve receipt and a lost create-curve send: wrapped as before, the
+        // original as cause. Keeping the hash of an ambiguous create-curve send is a later slice.
+        const reverted = await failCreateCurve([...feeSigned(), evmRpcOk("0xCreate"), evmRpcOk({ status: "0x0" })])
+        expect(reverted).toBeInstanceOf(CandleOperationError)
+        expect((reverted as Error).message).toContain("transaction reverted (receipt status 0x0)")
+        const lost = new TypeError("fetch failed")
+        const dropped = await failCreateCurve([...feeSigned(), lost])
+        expect(dropped).toBeInstanceOf(CandleOperationError)
+        expect((dropped as CandleOperationError).cause).toBe(lost)
+      })
+    })
+
+    describe("Solana blockhash-expiry rebuild", () => {
+      function blockhashNotFoundError(): Response {
+        return json(200, {
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            code: -32002,
+            message: "Transaction simulation failed",
+            data: { err: "BlockhashNotFound", logs: [] },
+          },
+        })
+      }
+
+      test("rebuilds once (same clientLaunchId) after a blockhash-expiry broadcast failure, re-signs, rebroadcasts, and confirms with the SECOND signature", async () => {
+        const store = await keyedSecretStore()
+        const rebuiltLaunch = { ...BUILD_SELF_LAUNCH_SOLANA, transaction: "AQADABc5rebuiltunsignedlaunch" }
+        const confirmedSecondAttempt = { ...LAUNCH_OK, signature: "BroadcastSig333" }
+        const { client, calls } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+          [
+            json(200, BUILD_SELF_LAUNCH_SOLANA), // build #1
+            json(200, SIGN_RELAY_OK), // sign #1
+            blockhashNotFoundError(), // broadcast #1 fails: BlockhashNotFound
+            json(200, rebuiltLaunch), // build #2 (rebuild, same clientLaunchId)
+            json(200, SIGN_RELAY_OK), // sign #2 (the rebuilt tx)
+            solanaRpcOk("BroadcastSig333"), // broadcast #2 succeeds
+            json(200, confirmedSecondAttempt), // confirm with the SECOND signature
+          ],
+        )
+        const result = await launchSelf(client, {
+          ...LAUNCH_REQ,
+          clientLaunchId: "run-linked-1",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        })
+        expect(result).toEqual({ ...confirmedSecondAttempt, clientLaunchId: "run-linked-1" } as never)
+
+        const buildCalls = calls.filter((c) => c.url === "https://api.test/api/v1/launch/self/build")
+        expect(buildCalls).toHaveLength(2)
+        const buildBodies = buildCalls.map((c) => JSON.parse(String(c.body)) as BuildSelfLaunchRequest)
+        expect(buildBodies[0]?.clientLaunchId).toBe(buildBodies[1]?.clientLaunchId)
+
+        const signCalls = calls.filter((c) => c.url === SIGN_RELAY_URL)
+        expect(signCalls).toHaveLength(2)
+        const signedTransactions = signCalls.map(
+          (c) => (JSON.parse(String(c.body)) as { body: { params: { transaction: string } } }).body.params.transaction,
+        )
+        expect(signedTransactions).toEqual(["AQADABc5unsignedlaunch", "AQADABc5rebuiltunsignedlaunch"])
+
+        expect(calls.filter((c) => c.url === SOLANA_RPC)).toHaveLength(2)
+
+        const confirmCall = calls[calls.length - 1]
+        const confirmSent = JSON.parse(String(confirmCall?.body)) as { clientLaunchId: string; signature: string }
+        expect(confirmSent).toEqual({ clientLaunchId: "run-linked-1", signature: "BroadcastSig333" })
+      })
+
+      test("a non-blockhash broadcast error throws immediately with NO rebuild", async () => {
+        const store = await keyedSecretStore()
+        const { client, calls } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+          [
+            json(200, BUILD_SELF_LAUNCH_SOLANA), // build
+            json(200, SIGN_RELAY_OK), // sign
+            json(200, { jsonrpc: "2.0", id: 1, error: { code: -32603, message: "Internal JSON-RPC error" } }),
+          ],
+        )
+        const error = await launchSelf(client, {
+          ...LAUNCH_REQ,
+          clientLaunchId: "run-linked-1",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }).catch((e) => e)
+        expect(error).toBeInstanceOf(JsonRpcError)
+        expect((error as JsonRpcError).code).toBe(-32603)
+        expect(calls.filter((c) => c.url === "https://api.test/api/v1/launch/self/build")).toHaveLength(1)
+        expect(calls.some((c) => c.url === "https://api.test/api/v1/launch/self/confirm")).toBe(false)
+      })
+
+      test("exhausting every rebuild throws the last JsonRpcError after exactly MAX_BLOCKHASH_REBUILDS + 1 (3) broadcast attempts", async () => {
+        const store = await keyedSecretStore()
+        const rebuilt2 = { ...BUILD_SELF_LAUNCH_SOLANA, transaction: "AQADABc5rebuilt2" }
+        const rebuilt3 = { ...BUILD_SELF_LAUNCH_SOLANA, transaction: "AQADABc5rebuilt3" }
+        const { client, calls } = makeClient(
+          { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+          [
+            json(200, BUILD_SELF_LAUNCH_SOLANA), // build #1
+            json(200, SIGN_RELAY_OK), // sign #1
+            blockhashNotFoundError(), // broadcast #1 fails
+            json(200, rebuilt2), // build #2 (rebuild: the earlier one expired, a new transaction)
+            json(200, SIGN_RELAY_OK), // sign #2
+            blockhashNotFoundError(), // broadcast #2 fails
+            json(200, rebuilt3), // build #3 (rebuild)
+            json(200, SIGN_RELAY_OK), // sign #3
+            blockhashNotFoundError(), // broadcast #3 fails -- attempts exhausted, throw
+          ],
+        )
+        const error = await launchSelf(client, {
+          ...LAUNCH_REQ,
+          clientLaunchId: "run-linked-1",
+          linkedWalletId: LINKED_WALLET_ID,
+          privyWalletId: PRIVY_WALLET_ID,
+        }).catch((e) => e)
+        expect(error).toBeInstanceOf(JsonRpcError)
+        const err = error as JsonRpcError
+        expect(err.code).toBe(-32002) // structured cause preserved through the hint wrapper
+        expect(err.data).toEqual({ err: "BlockhashNotFound", logs: [] })
+        expect(err.message).toContain("lagging or rate-limited")
+        expect(err.message).toContain("Helius")
+        expect(calls.filter((c) => c.url === "https://api.test/api/v1/launch/self/build")).toHaveLength(3)
+        expect(calls.filter((c) => c.url === SOLANA_RPC)).toHaveLength(3)
+        expect(calls.some((c) => c.url === "https://api.test/api/v1/launch/self/confirm")).toBe(false)
+      })
+
+      // BE-1382 (A24): one clientLaunchId has one build at a time on the server. A repeat /build
+      // answers the same transaction while it can still land, and its sign claim is single use,
+      // so selfLaunch() keeps the bytes it signed instead of asking the relay to sign them again.
+      describe("the signed bytes are kept across a repeat build", () => {
+        /** A signed transaction: one signature (the transaction id), then its message. */
+        const SIGNATURE_BYTES = new Uint8Array(64).map((_, i) => i + 1)
+        const HELD_SIGNATURE = base58.encode(SIGNATURE_BYTES)
+        const SIGNED_TX = Buffer.from([1, ...SIGNATURE_BYTES, 9, 9, 9]).toString("base64")
+        const SIGN_RELAY_SIGNED = { success: true, signedTransaction: SIGNED_TX, encoding: "base64" }
+        const BUILD_URL = "https://api.test/api/v1/launch/self/build"
+        const CONFIRM_URL = "https://api.test/api/v1/launch/self/confirm"
+        const refusal = (reason: string, retryable: boolean) =>
+          json(409, {
+            success: false,
+            error: {
+              code: "IDEMPOTENCY_CONFLICT",
+              message: "An earlier build of this launch",
+              retryable,
+              reason,
+              mint: "Mint111",
+              ...(retryable ? { retryAfter: 1692345699000 } : {}),
+            },
+          })
+        const launch = (client: CandleClient) =>
+          launchSelf(client, {
+            ...LAUNCH_REQ,
+            clientLaunchId: "run-linked-1",
+            linkedWalletId: LINKED_WALLET_ID,
+            privyWalletId: PRIVY_WALLET_ID,
+          })
+        const broadcastOf = (call: { body?: unknown } | undefined) =>
+          (JSON.parse(String(call?.body)) as { params: [string, { encoding: string }] }).params[0]
+
+        test("the same transaction back is broadcast again with the held bytes, and signed once", async () => {
+          const store = await keyedSecretStore()
+          const confirmed = { ...LAUNCH_OK, signature: "BroadcastSig444" }
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA), // build #1
+              json(200, SIGN_RELAY_SIGNED), // sign, once
+              blockhashNotFoundError(), // broadcast #1: this client's RPC is behind
+              json(200, BUILD_SELF_LAUNCH_SOLANA), // build #2: the same transaction, still live
+              solanaRpcOk("BroadcastSig444"), // broadcast #2, the held bytes
+              json(200, confirmed),
+            ],
+          )
+          expect(await launch(client)).toEqual({ ...confirmed, clientLaunchId: "run-linked-1" } as never)
+          expect(calls.filter((c) => c.url === BUILD_URL)).toHaveLength(2)
+          expect(calls.filter((c) => c.url === SIGN_RELAY_URL)).toHaveLength(1)
+          const broadcasts = calls.filter((c) => c.url === SOLANA_RPC)
+          expect(broadcasts.map(broadcastOf)).toEqual([SIGNED_TX, SIGNED_TX])
+          expect(JSON.parse(String(calls.at(-1)?.body))).toEqual({
+            clientLaunchId: "run-linked-1",
+            signature: "BroadcastSig444",
+          })
+        })
+
+        test("prior_attempt_in_flight does the same: no second sign, the held bytes again", async () => {
+          const store = await keyedSecretStore()
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              json(200, SIGN_RELAY_SIGNED),
+              blockhashNotFoundError(),
+              refusal("prior_attempt_in_flight", true), // build #2 refused: it can still land
+              solanaRpcOk("BroadcastSig444"),
+              json(200, LAUNCH_OK),
+            ],
+          )
+          expect(await launch(client)).toMatchObject({ clientLaunchId: "run-linked-1" })
+          expect(calls.filter((c) => c.url === SIGN_RELAY_URL)).toHaveLength(1)
+          expect(calls.filter((c) => c.url === SOLANA_RPC).map(broadcastOf)).toEqual([SIGNED_TX, SIGNED_TX])
+          expect(calls.filter((c) => c.url === CONFIRM_URL)).toHaveLength(1)
+        })
+
+        test("prior_attempt_on_chain confirms with the signature of the bytes it holds", async () => {
+          const store = await keyedSecretStore()
+          const confirmed = { ...LAUNCH_OK, signature: HELD_SIGNATURE }
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              json(200, SIGN_RELAY_SIGNED),
+              blockhashNotFoundError(),
+              refusal("prior_attempt_on_chain", false), // build #2 refused: it landed
+              json(200, confirmed),
+            ],
+          )
+          expect(await launch(client)).toEqual({ ...confirmed, clientLaunchId: "run-linked-1" } as never)
+          expect(calls.filter((c) => c.url === SIGN_RELAY_URL)).toHaveLength(1)
+          expect(calls.filter((c) => c.url === SOLANA_RPC)).toHaveLength(1)
+          expect(JSON.parse(String(calls.at(-1)?.body))).toEqual({
+            clientLaunchId: "run-linked-1",
+            signature: HELD_SIGNATURE,
+          })
+        })
+
+        test("a different transaction is signed once, and that one is broadcast", async () => {
+          const store = await keyedSecretStore()
+          const rebuiltLaunch = { ...BUILD_SELF_LAUNCH_SOLANA, transaction: "AQADABc5rebuiltunsignedlaunch" }
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA), // build #1
+              json(200, SIGN_RELAY_SIGNED), // sign #1
+              blockhashNotFoundError(),
+              json(200, rebuiltLaunch), // build #2: the first expired, a new transaction
+              json(200, SIGN_RELAY_OK), // sign #2, the new transaction
+              blockhashNotFoundError(),
+              json(200, rebuiltLaunch), // build #3: the same new transaction, still live
+              solanaRpcOk("BroadcastSig555"), // broadcast #3, with the bytes of sign #2
+              json(200, LAUNCH_OK),
+            ],
+          )
+          await launch(client)
+          const signedFor = calls
+            .filter((c) => c.url === SIGN_RELAY_URL)
+            .map(
+              (c) =>
+                (JSON.parse(String(c.body)) as { body: { params: { transaction: string } } }).body.params.transaction,
+            )
+          expect(signedFor).toEqual(["AQADABc5unsignedlaunch", "AQADABc5rebuiltunsignedlaunch"])
+          expect(calls.filter((c) => c.url === SOLANA_RPC).map(broadcastOf)).toEqual([
+            SIGNED_TX,
+            SIGN_RELAY_OK.signedTransaction,
+            SIGN_RELAY_OK.signedTransaction,
+          ])
+        })
+
+        test("the loop bound is unchanged: three broadcasts of the held bytes, then the lag hint", async () => {
+          const store = await keyedSecretStore()
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              json(200, SIGN_RELAY_SIGNED),
+              blockhashNotFoundError(),
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              blockhashNotFoundError(),
+              refusal("prior_attempt_in_flight", true),
+              blockhashNotFoundError(),
+            ],
+          )
+          const error = await launch(client).catch((e) => e)
+          expect(error).toBeInstanceOf(JsonRpcError)
+          expect((error as JsonRpcError).message).toContain("lagging or rate-limited")
+          expect(calls.filter((c) => c.url === SIGN_RELAY_URL)).toHaveLength(1)
+          expect(calls.filter((c) => c.url === SOLANA_RPC)).toHaveLength(3)
+          expect(calls.filter((c) => c.url === BUILD_URL)).toHaveLength(3)
+        })
+
+        test("prior_attempt_on_chain with bytes that carry no signature throws the refusal, with its reason", async () => {
+          const store = await keyedSecretStore()
+          const { client, calls } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              json(200, SIGN_RELAY_OK), // "signed-tx": not a transaction a signature can be read from
+              blockhashNotFoundError(),
+              refusal("prior_attempt_on_chain", false),
+            ],
+          )
+          const error = await launch(client).catch((e) => e)
+          expect(error).toBeInstanceOf(CandleApiError)
+          expect(error).toMatchObject({
+            code: "IDEMPOTENCY_CONFLICT",
+            reason: "prior_attempt_on_chain",
+            mint: "Mint111",
+            clientLaunchId: "run-linked-1",
+          })
+          expect(calls.some((c) => c.url === CONFIRM_URL)).toBe(false)
+        })
+
+        test("any other refusal of the repeat build still throws as it is", async () => {
+          const store = await keyedSecretStore()
+          const { client } = makeClient(
+            { ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID, solanaRpcUrl: SOLANA_RPC },
+            [
+              json(200, BUILD_SELF_LAUNCH_SOLANA),
+              json(200, SIGN_RELAY_SIGNED),
+              blockhashNotFoundError(),
+              json(500, {
+                success: false,
+                error: { code: "LAUNCH_FAILED", message: "chain", retryable: true, reason: "chain_read_failed" },
+              }),
+            ],
+          )
+          const error = await launch(client).catch((e) => e)
+          expect(error).toMatchObject({ code: "LAUNCH_FAILED", reason: "chain_read_failed", retryable: true })
+        })
+      })
+    })
+  })
+
+  describe("launchAtomic() (mixed signer legs)", () => {
+    const ATOMIC_LINKED_WALLET_ID_2 = "wallet-456"
+    const ATOMIC_PRIVY_WALLET_ID_2 = "privy-wallet-456"
+    const ATOMIC_SIGN_RELAY_URL_2 = `https://api.test/api/v1/agent/wallets/${ATOMIC_LINKED_WALLET_ID_2}/sign`
+
+    /** A secretStore holding BOTH linked wallets' signer PEMs, so a bundle mixing two different linked payers can sign each leg. */
+    async function twoWalletSecretStore(): Promise<SecretStore> {
+      const store = new InMemorySecretStore()
+      const { privateKeyPem: pem1 } = await generateSignerKeypair()
+      const { privateKeyPem: pem2 } = await generateSignerKeypair()
+      await store.set(LINKED_WALLET_ID, pem1)
+      await store.set(ATOMIC_LINKED_WALLET_ID_2, pem2)
+      return store
+    }
+
+    const ATOMIC_LAUNCH_REQ_BASE = {
+      clientLaunchId: "atomic-run-linked-1",
+      chain: "solana" as const,
+      name: "Atomic Coin",
+      symbol: "ATOM",
+      imageUrl: "https://example.com/atomic.png",
+    }
+
+    /** Leg 0 (launch): client signer, LINKED_WALLET_ID. Leg 1 (buy): server signer (main payer), no unsignedTxBase64. Leg 2 (buy): client signer, the SECOND linked wallet, non-zero index -- Task 4's own review flagged this exact case (a client leg NOT at index 0). */
+    const ATOMIC_BUILT_MIXED = {
+      bundleId: "bundle-mixed-1",
+      legs: [
+        { index: 0, role: "launch", signer: "client", unsignedTxBase64: "unsigned-launch" },
+        { index: 1, role: "buy", signer: "server", expectedFill: { amountOutRaw: "500000" } },
+        {
+          index: 2,
+          role: "buy",
+          signer: "client",
+          unsignedTxBase64: "unsigned-buy-2",
+          expectedFill: { amountOutRaw: "480000" },
+        },
+      ],
+      expiresAt: 1692345678000,
+    }
+
+    test("signs every client leg in leg order and submits EXACTLY those, in order (server leg is skipped, not padded)", async () => {
+      const store = await twoWalletSecretStore()
+      const landed = {
+        status: "landed",
+        bundleId: "bundle-mixed-1",
+        mint: "Mint111",
+        signatures: ["SigLaunch", "SigBuy1", "SigBuy2"],
+      }
+      const { client, calls } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID }, [
+        json(200, ATOMIC_BUILT_MIXED),
+        json(200, { success: true, signedTransaction: "signed-launch-tx", encoding: "base64" }),
+        json(200, { success: true, signedTransaction: "signed-buy-2-tx", encoding: "base64" }),
+        json(200, landed),
+      ])
+      const req: LaunchAtomicRequest = {
+        ...ATOMIC_LAUNCH_REQ_BASE,
+        payer: { type: "linked", linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        firstBuys: [
+          { payer: { type: "main" }, amountRaw: "1000000" },
+          {
+            payer: {
+              type: "linked",
+              linkedWalletId: ATOMIC_LINKED_WALLET_ID_2,
+              privyWalletId: ATOMIC_PRIVY_WALLET_ID_2,
+            },
+            amountRaw: "2000000",
+          },
+        ],
+      }
+      const result = await client.launchAtomic(req)
+      expect(result).toEqual({ ...landed, clientLaunchId: "atomic-run-linked-1" } as never)
+
+      // build -> sign leg 0 (LINKED_WALLET_ID) -> sign leg 2 (the SECOND wallet) -> submit, in that
+      // exact order; no call at all for leg 1 (the server/main-payer leg).
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.test/api/v1/launch/atomic/build",
+        SIGN_RELAY_URL,
+        ATOMIC_SIGN_RELAY_URL_2,
+        "https://api.test/api/v1/launch/atomic/submit",
+      ])
+
+      const buildSent = JSON.parse(String(calls[0]?.body)) as BuildAtomicLaunchRequest
+      expect(buildSent.payer).toEqual({ type: "linked", linkedWalletId: LINKED_WALLET_ID })
+      expect(buildSent.firstBuys).toEqual([
+        { payer: { type: "main" }, amountRaw: "1000000" },
+        { payer: { type: "linked", linkedWalletId: ATOMIC_LINKED_WALLET_ID_2 }, amountRaw: "2000000" },
+      ])
+      // privyWalletId never leaves the process -- the server-bound build body carries neither.
+      expect(JSON.stringify(buildSent)).not.toContain("privy-wallet")
+
+      const leg0SignBody = JSON.parse(String(calls[1]?.body)) as { body: { params: { transaction: string } } }
+      expect(leg0SignBody.body.params.transaction).toBe("unsigned-launch")
+      const leg2SignBody = JSON.parse(String(calls[2]?.body)) as { body: { params: { transaction: string } } }
+      expect(leg2SignBody.body.params.transaction).toBe("unsigned-buy-2")
+
+      const submitSent = JSON.parse(String(calls[3]?.body)) as SubmitAtomicLaunchRequest
+      expect(submitSent).toEqual({
+        bundleId: "bundle-mixed-1",
+        signedTxsBase64: ["signed-launch-tx", "signed-buy-2-tx"],
+      })
+    })
+
+    test("a failed outcome after signing is returned, not thrown", async () => {
+      const store = await twoWalletSecretStore()
+      const failed = { status: "failed", bundleId: "bundle-mixed-1", retryable: false }
+      const { client } = makeClient({ ...KEYED, secretStore: store, privyAppId: PRIVY_APP_ID }, [
+        json(200, ATOMIC_BUILT_MIXED),
+        json(200, { success: true, signedTransaction: "signed-launch-tx", encoding: "base64" }),
+        json(200, { success: true, signedTransaction: "signed-buy-2-tx", encoding: "base64" }),
+        json(502, failed),
+      ])
+      const result = await client.launchAtomic({
+        ...ATOMIC_LAUNCH_REQ_BASE,
+        payer: { type: "linked", linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+        firstBuys: [
+          { payer: { type: "main" }, amountRaw: "1000000" },
+          {
+            payer: {
+              type: "linked",
+              linkedWalletId: ATOMIC_LINKED_WALLET_ID_2,
+              privyWalletId: ATOMIC_PRIVY_WALLET_ID_2,
+            },
+            amountRaw: "2000000",
+          },
+        ],
+      })
+      expect(result).toEqual({ ...failed, clientLaunchId: "atomic-run-linked-1" } as never)
+    })
+
+    test("a missing secretStore/privyAppId throws a clear error BEFORE any client leg is submitted", async () => {
+      const { client, calls } = makeClient(KEYED, [json(200, ATOMIC_BUILT_MIXED)])
+      await expect(
+        client.launchAtomic({
+          ...ATOMIC_LAUNCH_REQ_BASE,
+          payer: { type: "linked", linkedWalletId: LINKED_WALLET_ID, privyWalletId: PRIVY_WALLET_ID },
+          firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+        }),
+      ).rejects.toThrow(/privyAppId/)
+      // build already ran (the failure is discovered while signing leg 0), but submit never did.
+      expect(calls.some((c) => c.url === "https://api.test/api/v1/launch/atomic/submit")).toBe(false)
+    })
+  })
+})
+
+describe("expandPreset (local, no fetch)", () => {
+  const presets: PresetsPayload = {
+    matrixVersion: 1,
+    presets: [
+      {
+        name: "hood-open-eth-v4",
+        description: "ETH-quoted Open launch on Hood",
+        chain: "hood",
+        quoteAsset: "eth",
+        mode: "open",
+        dexVersion: "v4",
+        stakerAllocationBps: 50,
+        terms: {
+          symbol: "ETH",
+          thresholdRaw: "4000000000000000000",
+          raise: 4,
+          startFdv: 1,
+          bondingFdv: 8,
+          supplySoldPct: 50,
+        },
+      },
+    ],
+  }
+
+  test("merges the preset fragment with overrides, overrides winning", () => {
+    const { client, calls } = makeClient({}, [])
+    const req = client.expandPreset(presets, "hood-open-eth-v4", {
+      name: "Trend Coin",
+      symbol: "TREND",
+      imageUrl: "https://example.com/logo.png",
+      stakerAllocationBps: 100,
+    })
+    expect(req).toEqual({
+      chain: "hood",
+      quoteAsset: "eth",
+      mode: "open",
+      dexVersion: "v4",
+      stakerAllocationBps: 100,
+      name: "Trend Coin",
+      symbol: "TREND",
+      imageUrl: "https://example.com/logo.png",
+    })
+    expect(calls.length).toBe(0)
+  })
+
+  test("throws on an unknown preset name, listing the known ones", () => {
+    const { client } = makeClient({}, [])
+    expect(() => client.expandPreset(presets, "nope")).toThrow(/Unknown preset "nope".*hood-open-eth-v4/)
+  })
+})
+
+describe("errors", () => {
+  test("a structured envelope throws CandleApiError with code/status/retryable/field", async () => {
+    const { client } = makeClient({}, [
+      envelope(400, "VALIDATION_FAILED", { field: "chain", message: "chain must be solana or hood" }),
+    ])
+    const error = await client.getMarket("solana", "Mint111").catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(CandleApiError)
+    const apiError = error as CandleApiError
+    expect(apiError.code).toBe("VALIDATION_FAILED")
+    expect(apiError.status).toBe(400)
+    expect(apiError.retryable).toBe(false)
+    expect(apiError.field).toBe("chain")
+    expect(apiError.message).toBe("chain must be solana or hood")
+  })
+
+  test("a retryable envelope surfaces retryable: true", async () => {
+    const { client } = makeClient({}, [envelope(404, "MARKET_NOT_FOUND", { retryable: true })])
+    const error = (await client.getMarket("solana", "Mint111").catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("MARKET_NOT_FOUND")
+    expect(error.retryable).toBe(true)
+  })
+
+  test("a non-envelope non-2xx throws CandleApiError with code HTTP_<status>", async () => {
+    const { client } = makeClient({}, [json(404, { error: "User not found" })])
+    const error = (await client.getAgentProfile("nobody").catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("HTTP_404")
+    expect(error.status).toBe(404)
+    expect(error.retryable).toBe(false)
+  })
+})
+
+describe("api key requirement", () => {
+  test("keyed methods throw a plain Error naming apiKey before any fetch", async () => {
+    const { client, calls } = makeClient({}, [])
+    const attempts: (() => Promise<unknown>)[] = [
+      () => client.launch(LAUNCH_REQ),
+      () => client.launchAsync(LAUNCH_REQ),
+      () => client.dryRunLaunch(LAUNCH_REQ),
+      () => client.getLaunchJob("run-1"),
+      () => client.reportActivity("solana", "Sig111"),
+      () => client.uploadImage(new Uint8Array([1]), "image/png"),
+      () => client.listWallets(),
+      () => client.getSpendLimits(),
+      () => client.getPortfolio(),
+      () => client.swap({ from: "SOL", to: "USDC", amountRaw: "1000000" }),
+      () => client.wallets.swapReceipt("sig1"),
+      () => client.wallets.selfBalances(),
+      () =>
+        client.buildTrade({
+          clientTradeId: "trade-1",
+          mint: "Mint111",
+          side: "buy",
+          amountRaw: "1000000",
+          payer: { type: "main" },
+        }),
+      () => client.confirmTrade({ clientTradeId: "trade-1", signature: "Sig111" }),
+      () => client.submit({ clientTradeId: "trade-1", signedTransactions: ["legA"] }),
+      () => client.trade({ mint: "Mint111", side: "buy", amountRaw: "1000000", from: "main" }),
+      () =>
+        client.signLinkedTransaction({
+          linkedWalletId: "wallet-1",
+          privyWalletId: "privy-1",
+          chain: "solana",
+          unsignedTransactionBase64: "AQ==",
+        }),
+      () => client.selfLaunch({ ...LAUNCH_REQ, linkedWalletId: "wallet-1", privyWalletId: "privy-1" }),
+      () =>
+        client.buildAtomicLaunch({
+          ...LAUNCH_REQ,
+          payer: { type: "main" },
+          firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+        }),
+      () => client.submitAtomicLaunch({ bundleId: "bundle-1", signedTxsBase64: [] }),
+      () =>
+        client.launchAtomic({
+          ...LAUNCH_REQ,
+          payer: { type: "main" },
+          firstBuys: [{ payer: { type: "main" }, amountRaw: "1000000" }],
+        }),
+    ]
+    for (const attempt of attempts) {
+      await expect(attempt()).rejects.toThrow(/apiKey/)
+    }
+    expect(calls.length).toBe(0)
+  })
+
+  test("public reads work without a key", async () => {
+    const { client } = makeClient({}, [json(200, { success: true, bucket: "new", tokens: [] })])
+    const feed = await client.getFeed("new")
+    expect(feed.tokens).toEqual([])
+  })
+})
+
+describe("launch retry policy", () => {
+  test("a bare 500 then 200 succeeds with the SAME clientLaunchId and exactly 2 calls", async () => {
+    const { client, calls } = makeClient(KEYED, [
+      new Response("upstream blew up", { status: 500 }),
+      json(200, LAUNCH_OK),
+    ])
+    const result = await client.launch(LAUNCH_REQ)
+    expect(result.mint).toBe("Mint111")
+    expect(calls.length).toBe(2)
+    const first = JSON.parse(String(calls[0]?.body)) as { clientLaunchId: string }
+    const second = JSON.parse(String(calls[1]?.body)) as { clientLaunchId: string }
+    expect(first.clientLaunchId).toBe("run-1")
+    expect(second.clientLaunchId).toBe("run-1")
+    expect(calls[0]?.body).toEqual(calls[1]?.body)
+  })
+
+  test("a network error is retried with the same generated id", async () => {
+    const { client, calls } = makeClient(KEYED, [new TypeError("fetch failed"), json(200, LAUNCH_OK)])
+    const { clientLaunchId: _omitted, ...withoutId } = LAUNCH_REQ
+    await client.launch(withoutId)
+    expect(calls.length).toBe(2)
+    const first = JSON.parse(String(calls[0]?.body)) as { clientLaunchId: string }
+    const second = JSON.parse(String(calls[1]?.body)) as { clientLaunchId: string }
+    expect(first.clientLaunchId).toMatch(/^sdk-/)
+    expect(second.clientLaunchId).toBe(first.clientLaunchId)
+  })
+
+  test("a non-retryable 400 envelope throws after exactly 1 call", async () => {
+    const { client, calls } = makeClient(KEYED, [envelope(400, "VALIDATION_FAILED", { field: "symbol" })])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("VALIDATION_FAILED")
+    expect(calls.length).toBe(1)
+  })
+
+  test("a retryable 409 (launch in flight) is retried", async () => {
+    const { client, calls } = makeClient(KEYED, [
+      envelope(409, "IDEMPOTENCY_CONFLICT", { retryable: true }),
+      json(200, LAUNCH_OK),
+    ])
+    const result = await client.launch(LAUNCH_REQ)
+    expect(result.signature).toBe("Sig111")
+    expect(calls.length).toBe(2)
+    expect(calls[0]?.body).toEqual(calls[1]?.body)
+  })
+
+  test("a non-retryable 409 (same id, different body) throws after 1 call", async () => {
+    const { client, calls } = makeClient(KEYED, [envelope(409, "IDEMPOTENCY_CONFLICT", { retryable: false })])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("IDEMPOTENCY_CONFLICT")
+    expect(error.status).toBe(409)
+    expect(calls.length).toBe(1)
+  })
+
+  test("a non-retryable 5xx envelope (LAUNCH_DISABLED) is never retried", async () => {
+    const { client, calls } = makeClient(KEYED, [envelope(503, "LAUNCH_DISABLED", { retryable: false })])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("LAUNCH_DISABLED")
+    expect(calls.length).toBe(1)
+  })
+
+  test("a retryable 500 whose stage is executed is not sent again", async () => {
+    const { client, calls } = makeClient(KEYED, [
+      envelope(500, "LAUNCH_FAILED", { retryable: true, stage: "executed", mint: "Mint111", signature: "Sig111" }),
+      json(200, LAUNCH_OK),
+    ])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.stage).toBe("executed")
+    expect(error.mint).toBe("Mint111")
+    expect(calls.length).toBe(1)
+  })
+
+  test("a retryable 500 whose stage is unconfirmed is not sent again", async () => {
+    const { client, calls } = makeClient(KEYED, [
+      envelope(500, "LAUNCH_FAILED", { retryable: true, stage: "unconfirmed", signature: "Sig111" }),
+      json(200, LAUNCH_OK),
+    ])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.stage).toBe("unconfirmed")
+    expect(calls.length).toBe(1)
+  })
+
+  test("retries are bounded by maxRetries", async () => {
+    const { client, calls } = makeClient({ ...KEYED, maxRetries: 1 }, [
+      new Response("boom", { status: 500 }),
+      new Response("boom", { status: 500 }),
+    ])
+    const error = (await client.launch(LAUNCH_REQ).catch((e: unknown) => e)) as CandleApiError
+    expect(error.code).toBe("HTTP_500")
+    expect(calls.length).toBe(2)
+  })
+})
+
+describe("waitForLaunch", () => {
+  test("polls until the job is confirmed", async () => {
+    const { client, calls } = makeClient(KEYED, [
+      json(200, jobBody("submitted")),
+      json(200, jobBody("confirming")),
+      json(200, jobBody("confirmed")),
+    ])
+    const job = await client.waitForLaunch("run-1", { pollMs: 1 })
+    expect(job.status).toBe("confirmed")
+    expect(calls.length).toBe(3)
+  })
+
+  test("returns a failed job as terminal (the caller branches on status)", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, jobBody("failed"))])
+    const job = await client.waitForLaunch("run-1", { pollMs: 1 })
+    expect(job.status).toBe("failed")
+    expect(calls.length).toBe(1)
+  })
+
+  test("times out cleanly when the job never turns terminal", async () => {
+    const { client } = makeClient(KEYED, [], () => json(200, jobBody("submitted")))
+    await expect(client.waitForLaunch("run-1", { timeoutMs: 5, pollMs: 1 })).rejects.toThrow(/timed out after 5ms/)
+  })
+})
+
+describe("BuildTradeResult chain discriminant (type-level)", () => {
+  // `bun test` transpiles TypeScript without type-checking it, so a broken discriminant would
+  // still pass every runtime assertion above. This function is never called for its behavior --
+  // it exists so `bun run typecheck` (tsc --noEmit) catches a regression that widens
+  // BuildTradeBuiltResult's `artifacts` back into one shared shape instead of narrowing per
+  // `chain`. The `@ts-expect-error` lines are the actual assertions: each one FAILS typecheck
+  // (removing the regression it guards against) if the field it names becomes reachable on the
+  // wrong chain's branch.
+  function assertDiscriminantNarrows(result: BuildTradeResult): string {
+    if (result.status !== "built") return result.signature // "executed": chain-agnostic fields only
+
+    if (result.chain === "solana") {
+      const transactionBase64: string = result.artifacts.transactionBase64
+      // @ts-expect-error narrowed to chain: "solana" -- `trade` only exists on the hood artifacts
+      const _hoodOnly = result.artifacts.trade
+      return transactionBase64
+    }
+
+    const trade: { to: string; data: string; value: string } = result.artifacts.trade
+    // @ts-expect-error narrowed to chain: "hood" -- `transactionBase64` only exists on the solana artifacts
+    const _solanaOnly = result.artifacts.transactionBase64
+    return trade.to
+  }
+
+  test("compiles (see the function's own doc comment for what this actually pins)", () => {
+    expect(typeof assertDiscriminantNarrows).toBe("function")
+  })
+})
+
+describe("AgentTierInfo.feeTotals (type-level)", () => {
+  // Same transpile-only caveat as the discriminant check above: this function is never called
+  // for its behavior, only typechecked by `bun run typecheck`. feeRawSum must stay a raw-unit
+  // BigInt string -- widening it to number would silently lose precision above 2^53.
+  type FeeTotalRow = AgentTierInfo["feeTotals"][number]
+  function assertFeeRawSumIsString(row: FeeTotalRow): string {
+    const feeRawSum: string = row.feeRawSum
+    // @ts-expect-error feeRawSum is a raw-unit BigInt string, never a number
+    const _notNumber: number = row.feeRawSum
+    return feeRawSum
+  }
+
+  test("compiles (see the function's own doc comment for what this actually pins)", () => {
+    expect(typeof assertFeeRawSumIsString).toBe("function")
+  })
+})
+
+describe("swapFromLinked", () => {
+  test("build -> relay-sign per transaction -> submit, returning the submit payload", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    const client = new CandleClient({
+      apiUrl: "https://api.test",
+      apiKey: "ck_live_x",
+      privyAppId: "app1",
+      secretStore: await (async () => {
+        const store = new InMemorySecretStore()
+        const { privateKeyPem } = await generateSignerKeypair()
+        await store.set("lw-1", privateKeyPem)
+        return store
+      })(),
+      fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url)
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+        calls.push({ url: u, body })
+        if (u.endsWith("/agent/swap/build")) {
+          return json(200, {
+            success: true,
+            payload: { swapId: "swap-1", transactionsBase64: ["dW5zaWduZWQ="] },
+          })
+        }
+        if (u.includes("/agent/wallets/lw-1/sign")) {
+          return json(200, { success: true, signedTransaction: "c2lnbmVk", encoding: "base64" })
+        }
+        if (u.endsWith("/agent/swap/submit")) {
+          return json(200, {
+            success: true,
+            payload: {
+              hashes: ["DepositHash1"],
+              expectedOutRaw: "16000000000000000",
+              outDecimals: 18,
+              statusChecks: ["https://api.relay.link/intents/status?requestId=r1"],
+              recipient: "0x00000000000000000000000000000000000000BB",
+              settlement: {
+                state: "pending",
+                legs: [{ chain: "solana", hash: "DepositHash1", status: "confirmed" }],
+                in: { asset: "SOL", raw: "3000000000" },
+                expectedOutRaw: "16000000000000000",
+              },
+            },
+          })
+        }
+        throw new Error(`unexpected fetch ${u}`)
+      }) as typeof fetch,
+    })
+
+    const result = await client.swapFromLinked({
+      from: "SOL",
+      to: "ETH",
+      amountRaw: "3000000000",
+      payer: { linkedWalletId: "lw-1", privyWalletId: "pw-1" },
+      toWalletId: "lw-evm-1",
+    })
+
+    expect(result.hashes).toEqual(["DepositHash1"])
+    expect(result.recipient).toBe("0x00000000000000000000000000000000000000BB")
+    expect(result.statusChecks.length).toBe(1)
+    // BE-505 (R8.4): the submit's settlement passes through; a bridge is pending until the fill.
+    expect(result.settlement?.state).toBe("pending")
+    expect(result.settlement?.settledOutRaw).toBeUndefined()
+
+    const build = calls.find((c) => c.url.endsWith("/agent/swap/build"))
+    expect(build?.body.payer).toEqual({ type: "linked", linkedWalletId: "lw-1" })
+    expect(build?.body.toWalletId).toBe("lw-evm-1")
+    const submit = calls.find((c) => c.url.endsWith("/agent/swap/submit"))
+    expect(submit?.body.swapId).toBe("swap-1")
+    expect(submit?.body.signedTransactionsBase64).toEqual(["c2lnbmVk"])
+  })
+})
+
+describe("close empty token accounts on a TEE wallet (BE-1687)", () => {
+  const BASE = "https://api.test/api/v1/agent/wallets/tee-sol/close-empty"
+
+  async function teeClient(answers: Record<string, () => Response>) {
+    const calls: Array<{ url: string; method: string; body: Record<string, unknown> }> = []
+    const store = new InMemorySecretStore()
+    await store.set("tee-sol", (await generateSignerKeypair()).privateKeyPem)
+    const client = new CandleClient({
+      apiUrl: "https://api.test",
+      apiKey: "ck_live_x",
+      privyAppId: "app1",
+      secretStore: store,
+      fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url)
+        calls.push({ url: u, method: init?.method ?? "GET", body: JSON.parse(String(init?.body ?? "{}")) })
+        for (const [suffix, answer] of Object.entries(answers)) if (u.endsWith(suffix)) return answer()
+        if (u.endsWith("/agent/wallets/tee-sol/sign")) {
+          const sent = JSON.parse(String(init?.body)) as { body: { params: { transaction: string } } }
+          return json(200, {
+            success: true,
+            signedTransaction: `signed:${sent.body.params.transaction}`,
+            encoding: "base64",
+          })
+        }
+        throw new Error(`unexpected fetch ${u}`)
+      }) as typeof fetch,
+    })
+    return { client, calls }
+  }
+
+  const BUILT = {
+    success: true,
+    status: "built",
+    clientTradeId: "close-1",
+    wallet: "TeeWallet1",
+    linkedWalletId: "tee-sol",
+    expiresAtBlockHeight: 1000,
+    transactions: [
+      { index: 0, unsignedTransaction: "dW5zaWduZWQtMA==", accounts: ["A1", "A2"], lamports: "4113360" },
+      { index: 1, unsignedTransaction: "dW5zaWduZWQtMQ==", accounts: ["A3"], lamports: "2039280" },
+    ],
+  }
+
+  test("previewCloseEmptyAccounts({ wallet }) posts the keep list to the TEE wallet's preview route", async () => {
+    const { client, calls } = await teeClient({ "/close-empty/preview": () => json(200, { success: true }) })
+    await client.previewCloseEmptyAccounts({ wallet: "tee-sol", keep: ["K"] })
+    expect(calls[0]?.url).toBe(`${BASE}/preview`)
+    expect(calls[0]?.body).toEqual({ keep: ["K"] })
+  })
+
+  test("closeEmptyAccounts({ wallet }): build, relay-sign each transaction, then submit the whole batch", async () => {
+    const report = { success: true, status: "completed", clientTradeId: "close-1", signatures: ["S0", "S1"] }
+    const { client, calls } = await teeClient({
+      "/close-empty/build": () => json(200, BUILT),
+      "/close-empty/submit": () => json(200, report),
+    })
+    const result = await client.closeEmptyAccounts({
+      wallet: "tee-sol",
+      privyWalletId: "pw-t",
+      clientTradeId: "close-1",
+      keep: ["K"],
+      accounts: ["A1", "A2", "A3"],
+    })
+    expect(calls.map((c) => c.url.replace("https://api.test/api/v1/agent/wallets/tee-sol", ""))).toEqual([
+      "/close-empty/build",
+      "/sign",
+      "/sign",
+      "/close-empty/submit",
+    ])
+    // Neither the wallet id nor the Privy id rides in the build body: the path names the wallet.
+    expect(calls[0]?.body).toEqual({ clientTradeId: "close-1", keep: ["K"], accounts: ["A1", "A2", "A3"] })
+    const signs = calls.filter((c) => c.url.endsWith("/sign"))
+    expect(signs.map((c) => (c.body.body as { params: { transaction: string } }).params.transaction)).toEqual([
+      "dW5zaWduZWQtMA==",
+      "dW5zaWduZWQtMQ==",
+    ])
+    expect(calls[3]?.body).toEqual({
+      clientTradeId: "close-1",
+      signed: [
+        { index: 0, signedTransaction: "signed:dW5zaWduZWQtMA==" },
+        { index: 1, signedTransaction: "signed:dW5zaWduZWQtMQ==" },
+      ],
+    })
+    expect(result).toEqual(report as never)
+  })
+
+  test("a recovering submit (202) is returned as the result, not thrown", async () => {
+    const recovering = {
+      success: true,
+      status: "recovering",
+      clientTradeId: "close-1",
+      unresolved: [{ index: 1, accounts: ["A3"], signature: "S1", reason: "no confirmed outcome yet" }],
+    }
+    const { client } = await teeClient({
+      "/close-empty/build": () => json(200, BUILT),
+      "/close-empty/submit": () => json(202, recovering),
+    })
+    const result = await client.closeEmptyAccounts({
+      wallet: "tee-sol",
+      privyWalletId: "pw-t",
+      clientTradeId: "close-1",
+    })
+    expect(result.status).toBe("recovering")
+    expect(result.unresolved?.[0]?.signature).toBe("S1")
+    expect(result.netLamports).toBeUndefined()
+  })
+
+  test("nothing to close returns without signing or submitting", async () => {
+    const { client, calls } = await teeClient({
+      "/close-empty/build": () =>
+        json(200, { success: true, status: "nothing_to_close", clientTradeId: "close-2", transactions: [] }),
+    })
+    const result = await client.closeEmptyAccounts({
+      wallet: "tee-sol",
+      privyWalletId: "pw-t",
+      clientTradeId: "close-2",
+    })
+    expect(result.status).toBe("nothing_to_close")
+    expect(result.lamportsRecovered).toBe("0")
+    expect(calls).toHaveLength(1)
+  })
+
+  test("a build refusal throws its code and signs nothing", async () => {
+    const { client, calls } = await teeClient({
+      "/close-empty/build": () => envelope(503, "LAUNCH_DISABLED"),
+    })
+    const error = await client
+      .closeEmptyAccounts({ wallet: "tee-sol", privyWalletId: "pw-t", clientTradeId: "close-3" })
+      .catch((e) => e)
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("LAUNCH_DISABLED")
+    expect(calls).toHaveLength(1)
+  })
+
+  test("a build that already began submitting answers from the job and signs nothing again", async () => {
+    const report = { success: true, status: "completed", clientTradeId: "close-1", signatures: ["S0", "S1"] }
+    const { client, calls } = await teeClient({
+      "/close-empty/build": () => json(200, { ...BUILT, submitState: "done", replayed: true }),
+      "/close-empty/jobs/close-1": () =>
+        json(200, {
+          success: true,
+          job: { clientTradeId: "close-1", status: "completed", httpStatus: 200, result: report },
+        }),
+    })
+    const result = await client.closeEmptyAccounts({
+      wallet: "tee-sol",
+      privyWalletId: "pw-t",
+      clientTradeId: "close-1",
+    })
+    expect(result).toEqual(report as never)
+    expect(calls.some((c) => c.url.endsWith("/sign") || c.url.endsWith("/submit"))).toBe(false)
+  })
+
+  test("a TEE wallet without privyWalletId is refused before any request", async () => {
+    const { client, calls } = await teeClient({})
+    await expect(client.closeEmptyAccounts({ wallet: "tee-sol", clientTradeId: "close-4" })).rejects.toThrow(
+      "requires privyWalletId",
+    )
+    expect(calls).toHaveLength(0)
+  })
+
+  test("getCloseEmptyAccountsJob(id, { wallet }) reads the TEE wallet's job route", async () => {
+    const job = { clientTradeId: "a/b", kind: "close-empty", walletKind: "tee", status: "built", createdAt: 1 }
+    const { client, calls } = await teeClient({ "/close-empty/jobs/a%2Fb": () => json(200, { success: true, job }) })
+    expect(await client.getCloseEmptyAccountsJob("a/b", { wallet: "tee-sol" })).toEqual(job as never)
+    expect(calls[0]?.url).toBe(`${BASE}/jobs/a%2Fb`)
+    expect(calls[0]?.method).toBe("GET")
+  })
+})
+
+describe("swapFromLinked: a TEE payer's bridge (Ember 4c)", () => {
+  test("clientTradeId rides on the build and the submit, and a USDC origin is sent as is", async () => {
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+    const store = new InMemorySecretStore()
+    await store.set("tee-sol", (await generateSignerKeypair()).privateKeyPem)
+    const client = new CandleClient({
+      apiUrl: "https://api.test",
+      apiKey: "ck_live_x",
+      privyAppId: "app1",
+      secretStore: store,
+      fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url)
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+        calls.push({ url: u, body })
+        if (u.endsWith("/agent/swap/build"))
+          return json(200, { success: true, payload: { swapId: "swap-t", transactionsBase64: ["dW5zaWduZWQ="] } })
+        if (u.includes("/agent/wallets/tee-sol/sign"))
+          return json(200, { success: true, signedTransaction: "c2lnbmVk", encoding: "base64" })
+        return json(200, {
+          success: true,
+          payload: { hashes: ["D1"], expectedOutRaw: "1", outDecimals: 6, statusChecks: [], recipient: "0xAA" },
+        })
+      }) as typeof fetch,
+    })
+    await client.swapFromLinked({
+      from: "USDC",
+      to: "USDG",
+      amountRaw: "5000000",
+      payer: { linkedWalletId: "tee-sol", privyWalletId: "pw-t" },
+      clientTradeId: "bridge-1",
+    })
+    const build = calls.find((c) => c.url.endsWith("/agent/swap/build"))
+    expect(build?.body).toMatchObject({ from: "USDC", to: "USDG", clientTradeId: "bridge-1" })
+    expect(build?.body.toWalletId).toBeUndefined()
+    const submit = calls.find((c) => c.url.endsWith("/agent/swap/submit"))
+    expect(submit?.body).toMatchObject({ swapId: "swap-t", clientTradeId: "bridge-1" })
+  })
+
+  test("the bridge error codes are exported by name", async () => {
+    const { BRIDGE_ERROR_CODES } = await import("./index")
+    expect([...BRIDGE_ERROR_CODES]).toEqual(["BRIDGE_DESTINATION_MISSING", "RELAY_STEP_REFUSED", "BRIDGE_IN_FLIGHT"])
+  })
+})
+
+describe("maxRetries is validated, not trusted", () => {
+  // The loop is `attempt <= maxRetries`, so a negative value runs ZERO attempts and falls through
+  // to `throw lastError` before any error exists: the caller sees a TypeError about undefined
+  // rather than the mistake they actually made.
+  test("a negative, fractional, or non-finite value is refused at construction", () => {
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => new CandleClient({ apiUrl: "https://api.test", maxRetries: bad })).toThrow(
+        /maxRetries must be a non-negative integer/,
+      )
+    }
+  })
+
+  test("zero is legitimate and still allowed", () => {
+    expect(() => new CandleClient({ apiUrl: "https://api.test", maxRetries: 0 })).not.toThrow()
+  })
+})
+
+test.each([
+  "So11111111111111111111111111111111111111112",
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
+])("base asset %s verifies false and keeps additive market routing", async (mint) => {
+  const market = {
+    candleLaunched: false,
+    launchpad: null,
+    venue: "jupiter",
+    trade: { endpoint: "POST /api/v1/trade/agent/quote", routable: false, reason: "not_routable_yet" },
+  }
+  const { client } = makeClient({}, [
+    json(200, { success: true, candleLaunched: false, chain: "solana", mint }),
+    json(200, { success: true, market }),
+  ])
+  expect((await client.verify("solana", mint)).candleLaunched).toBe(false)
+  expect(await client.getMarket("solana", mint)).toMatchObject(market)
+})
+
+describe("getProfilePnl: per-wallet rows", () => {
+  test("a wallet row types its coverage, unresolved and friction fields", async () => {
+    const row = {
+      wallet: "W1",
+      payerType: "linked",
+      linkedWalletId: "lw1",
+      label: "Momentum",
+      realizedGrossUsd: 5,
+      feesUsd: 1,
+      realizedNetUsd: 4,
+      openPositions: [],
+      unrealizedUsd: 0,
+      unmarkedPositions: 0,
+      counted: 2,
+      unvalued: 1,
+      unresolved: 1,
+      unresolvedMints: ["MintA"],
+      friction: { feesUsd: 1, slippageUsd: 0.5, slippageBpsAvg: 30, measured: 2, unmeasured: 0 },
+      tradesConsidered: 3,
+    }
+    const { client } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", pnl: { byWallet: [row] } })])
+    const result = await client.getProfilePnl("ck_a")
+    const wallet = result.pnl.byWallet?.[0]
+    // Typed access: each of these is a compile error if the field is missing from the type.
+    expect(wallet?.unresolved).toBe(1)
+    expect(wallet?.unresolvedMints).toEqual(["MintA"])
+    expect(wallet?.friction.measured).toBe(2)
+    expect(wallet?.friction.slippageBpsAvg).toBe(30)
+  })
+})
+
+describe("getProfilePnl: per-chain figures (Ember Phase 4d)", () => {
+  const chainSummary = (counted: number) => ({
+    realizedGrossUsd: 0,
+    feesUsd: 0,
+    realizedNetUsd: 0,
+    openPositions: 1,
+    unrealizedUsd: 0,
+    unmarkedPositions: 1,
+    counted,
+    unvalued: 0,
+    unresolved: 0,
+    unresolvedMints: [],
+    friction: { feesUsd: 0, slippageUsd: 0, measured: 0, unmeasured: 0 },
+    tradesConsidered: counted,
+  })
+
+  test("positions, wallet rows and byChain carry their chain", async () => {
+    const pnl = {
+      openPositions: [
+        { mint: "0x9EB31F3a", chain: "hood", quantity: 10, avgEntryUsd: 1, costBasisUsd: 10 },
+        { mint: "MintSo1", chain: "solana", quantity: 100, avgEntryUsd: 1, costBasisUsd: 100 },
+      ],
+      byChain: { solana: chainSummary(1), hood: chainSummary(2) },
+      byWallet: [{ wallet: "0xF628F9fb", payerType: "main", chain: "hood", label: null, openPositions: [] }],
+    }
+    const { client } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", pnl })])
+    const result = await client.getProfilePnl("ck_a")
+    // Typed access: each of these is a compile error if the field is missing from the type.
+    expect(result.pnl.openPositions.map((p) => p.chain)).toEqual(["hood", "solana"])
+    expect(result.pnl.byChain?.hood.counted).toBe(2)
+    expect(result.pnl.byChain?.solana.openPositions).toBe(1)
+    expect(result.pnl.byChain?.hood.friction.unmeasured).toBe(0)
+    expect(result.pnl.byWallet?.[0]?.chain).toBe("hood")
+  })
+
+  test("a server that predates per-chain P&L still parses: the new fields are simply absent", async () => {
+    const pnl = { openPositions: [{ mint: "MintSo1", quantity: 1, avgEntryUsd: 1, costBasisUsd: 1 }] }
+    const { client } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", pnl })])
+    const result = await client.getProfilePnl("ck_a")
+    expect(result.pnl.byChain).toBeUndefined()
+    expect(result.pnl.openPositions[0]?.chain).toBeUndefined()
+  })
+})
+
+describe("getProfilePnl: one-engine fields (P&L spec R2, R4)", () => {
+  const closed = { closed: 2, madeUsd: 10, lostUsd: -4, partialSellsUsd: 1, wins: 1, losses: 1, costUnknown: 0 }
+  const engine = { totalUsd: 7, openPositionsExDust: 0, closedRounds: 2, closed }
+
+  test("the total, each chain and each wallet carry totalUsd, the closed equation and the dust-free count", async () => {
+    const pnl = {
+      realizedNetUsd: 7,
+      unrealizedUsd: 0,
+      ...engine,
+      openPositions: [
+        {
+          mint: "MintSo1",
+          chain: "solana",
+          wallet: "unknown:solana",
+          agent: "ck_a",
+          openedTs: 5,
+          quantity: 1,
+          avgEntryUsd: 0.001,
+          costBasisUsd: 0.001,
+          markPriceUsd: 0.0001,
+          marketValueUsd: 0.0001,
+          unrealizedUsd: -0.0009,
+          dust: true,
+        },
+      ],
+      byChain: { solana: { ...engine }, hood: { totalUsd: 0, closedRounds: 0 } },
+      byWallet: [{ wallet: "W1", payerType: "main", label: null, openPositions: [], ...engine }],
+    }
+    const { client } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", pnl })])
+    const result = await client.getProfilePnl("ck_a")
+    // Typed access: each of these is a compile error if the field is missing from the type.
+    expect(result.pnl.totalUsd).toBe(7)
+    const c = result.pnl.closed
+    expect(c && c.madeUsd + c.lostUsd + c.partialSellsUsd).toBe(result.pnl.realizedNetUsd)
+    expect(result.pnl.openPositionsExDust).toBe(0)
+    expect(result.pnl.closedRounds).toBe(2)
+    const position = result.pnl.openPositions[0]
+    expect(position?.dust).toBe(true)
+    expect(position?.wallet).toBe("unknown:solana")
+    expect(position?.agent).toBe("ck_a")
+    expect(position?.openedTs).toBe(5)
+    expect(result.pnl.byChain?.solana.closed?.wins).toBe(1)
+    expect(result.pnl.byWallet?.[0]?.totalUsd).toBe(7)
+  })
+
+  test("a server that predates the engine still parses: the new fields are simply absent", async () => {
+    const pnl = {
+      realizedNetUsd: 1,
+      openPositions: [{ mint: "MintSo1", quantity: 1, avgEntryUsd: 1, costBasisUsd: 1 }],
+    }
+    const { client } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", pnl })])
+    const result = await client.getProfilePnl("ck_a")
+    expect(result.pnl.totalUsd).toBeUndefined()
+    expect(result.pnl.closed).toBeUndefined()
+    expect(result.pnl.openPositions[0]?.dust).toBeUndefined()
+  })
+})
+
+describe("getPortfolio (Ember Phase 4d)", () => {
+  const body: PortfolioResult = {
+    success: true,
+    embedded: [{ chain: "solana", address: "SoLEmbedded1", lamports: "1500000000", tokens: [] }],
+    tee: [
+      {
+        chain: "solana",
+        id: "lw_sol",
+        address: "SoLTee1",
+        label: "momentum",
+        active: true,
+        lamports: null,
+        tokens: null,
+      },
+    ],
+    hood: {
+      embedded: [
+        {
+          chain: "hood",
+          address: "0xEmbeddedHood",
+          wei: "20000000000000000",
+          tokens: [{ chain: "hood", mint: "0x9EB31F3aBcD", amountRaw: "5000", decimals: 18, symbol: "HOOD" }],
+        },
+      ],
+      tee: [{ chain: "hood", id: "lw_hood", address: "0xTeeHood", active: false, wei: null, tokens: null }],
+      unavailable: ["0xTeeHood"],
+      unpriced: 1,
+      unpricedByReason: { "stale-mark": 1 },
+    },
+    prices: {
+      So11111111111111111111111111111111111111112: { priceUsd: 150, source: "jupiter", symbol: "SOL" },
+      "hood:native": { priceUsd: 2500, source: "reference" },
+      "hood:0x9eb31f3abcd": { priceUsd: null, source: null, updatedAt: 1, unpricedReason: "stale-mark" },
+    },
+    unavailable: ["SoLTee1"],
+    complete: false,
+    // The list finished. The failed reads are what make `complete` false.
+    walletsComplete: true,
+  }
+
+  test("GET /api/v1/agent/portfolio with the agent key header, returns the parsed shape", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, body)])
+    const result = await client.getPortfolio()
+    expect(calls[0]).toEqual({
+      url: "https://api.test/api/v1/agent/portfolio",
+      method: "GET",
+      headers: { "x-api-key": "cndl_test_key" },
+    })
+    expect(result).toEqual(body)
+    // A Hood token is priced under its lowercased contract (4d-ED-5).
+    const token = result.hood?.embedded[0]?.tokens?.[0]
+    expect(result.prices[`hood:${token?.mint.toLowerCase()}`]?.unpricedReason).toBe("stale-mark")
+    expect(result.hood?.tee[0]?.wei).toBeNull()
+  })
+
+  test("a server that predates Hood in the portfolio still parses: no hood section", async () => {
+    const solanaOnly = {
+      success: true,
+      embedded: [{ address: "SoLEmbedded1", lamports: "1", tokens: [] }],
+      tee: [],
+      prices: {},
+      unavailable: [],
+      complete: true,
+    }
+    const { client } = makeClient(KEYED, [json(200, solanaOnly)])
+    const result = await client.getPortfolio()
+    expect(result.hood).toBeUndefined()
+    expect(result.embedded[0]?.chain).toBeUndefined()
+    expect(result.walletsComplete).toBeUndefined()
+  })
+
+  test("a key without account:read gets SCOPE_MISSING as a typed error, after one call", async () => {
+    const { client, calls } = makeClient(KEYED, [envelope(403, "SCOPE_MISSING")])
+    const error = (await client.getPortfolio().catch((e: unknown) => e)) as CandleApiError
+    expect(error).toBeInstanceOf(CandleApiError)
+    expect(error.code).toBe("SCOPE_MISSING")
+    expect(error.status).toBe(403)
+    expect(calls.length).toBe(1)
+  })
+})
+
+describe("getProfileTrades: range, paging and fee fields (BE-900)", () => {
+  test("sends limit, since, until and cursor, and types the new row and page fields", async () => {
+    const row = {
+      clientTradeId: "t1",
+      createdAt: 1_000,
+      status: "built",
+      chain: "solana",
+      side: "buy",
+      mint: "MintA",
+      quoteAsset: "SOL",
+      amountRaw: "10",
+      feeBps: 100,
+      feeRaw: "100",
+      landedUnconfirmed: true,
+      payerWallet: "W1",
+      signature: "sig",
+      errorCode: "FEE_LEG_MISSING",
+    }
+    const { client, calls } = makeClient(KEYED, [
+      json(200, { success: true, keyPrefix: "ck_a", trades: [row], nextCursor: "abc" }),
+    ])
+    const result = await client.getProfileTrades("ck_a", {
+      limit: 50,
+      since: "2026-10-04T00:00:00Z",
+      until: new Date(1_759_622_400_000),
+      cursor: "prev+/=",
+    })
+    const url = new URL(calls[0]?.url ?? "")
+    expect(url.pathname).toBe("/api/v1/agent/keys/ck_a/trades")
+    expect(url.searchParams.get("limit")).toBe("50")
+    expect(url.searchParams.get("since")).toBe("2026-10-04T00:00:00Z")
+    expect(url.searchParams.get("until")).toBe("1759622400000")
+    expect(url.searchParams.get("cursor")).toBe("prev+/=")
+    // Typed access: each is a compile error if the field is missing from the type.
+    expect(result.nextCursor).toBe("abc")
+    expect(result.trades[0]?.landedUnconfirmed).toBe(true)
+    expect(result.trades[0]?.feeRaw).toBe("100")
+    expect(result.trades[0]?.feeCollectedRaw).toBeUndefined()
+  })
+
+  test("no options sends no query string", async () => {
+    const { client, calls } = makeClient(KEYED, [json(200, { success: true, keyPrefix: "ck_a", trades: [] })])
+    await client.getProfileTrades("ck_a")
+    expect(calls[0]?.url).toBe("https://api.test/api/v1/agent/keys/ck_a/trades")
+  })
+})

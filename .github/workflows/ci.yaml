@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Source
+    # Every commit on main comes from the monorepo sync and names the source commit it was built
+    # from. A commit without that trailer is a hand edit the next sync will overwrite.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: The head commit carries a Source trailer
+        run: |
+          if ! git log -1 --format=%B | grep -Eq '^Source: candledottv/candle-monorepo@[0-9a-f]{40}$'; then
+            echo "::error::The head commit has no Source trailer. Edit the monorepo, not this mirror."
+            exit 1
+          fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [sdk, mcp]
+    # Actions pinned to full commit SHAs with their tags in trailing comments: a tag is a moving
+    # pointer.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The CLI's Bun pin, copied at export: one pin across every Candle repository.
+          bun-version-file: .bun-version
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Build
+        working-directory: packages/${{ matrix.package }}
+        run: bun run build
+      - name: Typecheck
+        working-directory: packages/${{ matrix.package }}
+        run: bun run typecheck
+      - name: Test
+        working-directory: packages/${{ matrix.package }}
+        run: bun test

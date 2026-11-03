@@ -1,0 +1,93 @@
+import { CandleApiError } from "./errors";
+import type { AboutBurnHistory, AboutCapabilities, AboutComments, AboutHistory, AboutSection, AboutSeen, AboutToken, AboutUpdates, ClaimResult, CreatorChallenge, FlagReason, FlagResult, TokenAbout } from "./token-pages.types";
+export type TokenPageClaim = {
+    kind: "holder" | "creator";
+    challengeId?: string;
+    signature?: string;
+};
+export type TokenPageSectionEdit = {
+    text: string;
+    baseRevision: string;
+};
+export type TokenPageRestore = {
+    versionId: string;
+    baseRevision: string;
+};
+export type TokenPageFlag = {
+    contentId: string;
+    reason: FlagReason;
+    detail?: string;
+};
+export type TokenPagePagination = {
+    cursor?: string;
+    limit?: number;
+};
+export type TokenPageWriteOptions = {
+    idempotencyKey?: string;
+};
+export type TokenPageWritten = {
+    id: string;
+    revision: string;
+};
+export type TokenPageWriteResult<T> = {
+    data: T;
+    idempotencyKey: string;
+};
+/** A refusal retains its code/status; an unanswered write retains its key for explicit replay. */
+export declare class TokenPageError extends CandleApiError {
+    readonly idempotencyKey?: string;
+    readonly latest?: {
+        revision: string;
+        versionId: string | null;
+    };
+    readonly retryAfterHeader: string | null;
+    constructor(error: CandleApiError, options?: {
+        idempotencyKey?: string;
+        latest?: {
+            revision: string;
+            versionId: string | null;
+        };
+        retryAfterHeader?: string | null;
+    });
+}
+/** The API remains the authoritative validator, including strict bodies and fresh eligibility. */
+export interface CandleTokenPages {
+    updates(token: AboutToken, options?: TokenPagePagination): Promise<AboutUpdates>;
+    postUpdate(token: AboutToken, body: {
+        text: string;
+    }, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<{
+        id: string;
+        sequence: string;
+    }>>;
+    deletePost(token: AboutToken, id: string, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<{
+        id: string;
+        deleted: true;
+    }>>;
+    /** Public newest-first comments with tombstones; sends no key. */
+    comments(token: AboutToken, options?: TokenPagePagination): Promise<AboutComments>;
+    /** An immutable comment under the 0.5% editing gate. Never pushed; delete it with `deletePost`. */
+    postComment(token: AboutToken, body: {
+        text: string;
+    }, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<{
+        id: string;
+    }>>;
+    seen(token: AboutToken): Promise<AboutSeen>;
+    markSeen(token: AboutToken, visibleUpdateSequence: string, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<AboutSeen>>;
+    about(token: AboutToken): Promise<TokenAbout>;
+    capabilities(token: AboutToken): Promise<AboutCapabilities>;
+    burns(token: AboutToken, options?: TokenPagePagination): Promise<AboutBurnHistory>;
+    history(token: AboutToken, section: AboutSection, options?: TokenPagePagination): Promise<AboutHistory>;
+    /** One fresh message-only challenge. Sign its exact UTF-8 bytes locally; this never signs. */
+    creatorChallenge(token: AboutToken): Promise<CreatorChallenge>;
+    claim(token: AboutToken, body: TokenPageClaim, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<ClaimResult>>;
+    setSection(token: AboutToken, section: AboutSection, body: TokenPageSectionEdit, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<TokenPageWritten>>;
+    restoreSection(token: AboutToken, section: AboutSection, body: TokenPageRestore, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<TokenPageWritten>>;
+    flag(token: AboutToken, body: TokenPageFlag, options?: TokenPageWriteOptions): Promise<TokenPageWriteResult<FlagResult>>;
+}
+/** @internal CandleClient supplies its guarded transport and SDK headers. */
+export declare function createTokenPagesClient(io: {
+    fetch: (input: string, init: RequestInit) => Promise<Response>;
+    apiUrl(): string;
+    headers(authenticated: boolean): Record<string, string>;
+}): CandleTokenPages;
+//# sourceMappingURL=token-pages.d.ts.map

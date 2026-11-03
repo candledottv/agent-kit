@@ -1,0 +1,12 @@
+{
+  "name": "candle-agent-kit",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "@types/node": "20.19.37",
+    "typescript": "5.9.3"
+  }
+}

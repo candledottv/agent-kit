@@ -1,0 +1,6 @@
+{"version":2,"width":110,"height":25,"env":{"TERM":"xterm-256color"},"title":"Demo data · local fixture"}
+[0.00277493400000003,"o","Demo data $ "]
+[0.023581350000000043,"o","market-read 'Call candle_get_feed with {\"bucket\":\"new\"}. Summarize without a trade.'\r\n"]
+[0.18973606000000007,"o","Demo data · read-only scripted MCP client · no language model\r\nRequest: Call candle_get_feed with {\"bucket\":\"new\"}. Summarize without a trade.\r\n> candle_get_feed {\"bucket\":\"new\"}\r\n  no API key · local demo server\r\n"]
+[0.19979375200000016,"o","< isError: false\r\nFeed: new; success: true\r\n  EMBR  Demo data: Ember  (solana)\r\n  WICK  Demo data: Wick  (hood)\r\nSource: local fixture. Indexed does not mean tradeable. No trade made.\r\n"]
+[0.21304055300000016,"o","Demo data $ "]
